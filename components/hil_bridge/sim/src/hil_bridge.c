@@ -5,8 +5,12 @@
 ** connected over a serial port, can act as the flight computer:
 **
 **   MCU <--hil_link frames--> hil_bridge --NOS Engine--> usart_N / i2c_N / spi_N / can_N --> device sims
-**                                        --UDP-------->  radio-sim (CI 5010 in, TO 5011 out,
-**                                                                   radio 5015 in, 5014 out)
+**                                        --NOS Engine--> time bus (simulation time -> TIME frames)
+**                                        --UDP-------->  trq-sim:14242 (magnetorquers)
+**                                        --UDP-------->  COSMOS umbilical (TC in :9010, TM out :9011)
+**                                        --UDP-------->  ground link emulator (RF in :9020, RF out :9021)
+**
+** Interfaces are specified in the HITL FlatSat ICD (IF-01, IF-02, section 8).
 **
 ** Bus handling mirrors fsw/apps/hwlib/sim/src (lib*.c, nos_link.c): buses are opened lazily on first
 ** use with the same bus names, node name and master address, so the device sims need no changes.
@@ -48,16 +52,30 @@
 #define HIL_POLL_MS          2
 #define HIL_LINK_TIMEOUT_S   3
 
+#define HIL_TIME_PERIOD_S    1
+#define HIL_TRQ_MAX_DUTY     10000 /* 100.00 % */
+
 typedef struct
 {
     const char *serial_dev;
     int         baud;
     const char *nos_uri;
-    const char *radio_host;
-    int         ci_port;       /* listen: commands from radio sim */
-    int         to_port;       /* send:   telemetry to radio sim */
-    int         radio_rx_port; /* listen: radio device traffic from radio sim */
-    int         radio_tx_port; /* send:   radio device commands to radio sim */
+    /* Umbilical (ICD IF-06): space packets to/from COSMOS FLATSAT_UMB */
+    const char *umb_host;
+    int         umb_tc_port; /* listen */
+    int         umb_tm_port; /* send */
+    /* Simulated RF link (ICD 7.5): RF frames to/from the ground station link emulator */
+    const char *rf_host;
+    int         rf_rx_port;  /* listen */
+    int         rf_tx_port;  /* send */
+    /* Magnetorquer sim, same UDP text protocol as hwlib libtrq */
+    const char *trq_host;
+    int         trq_port;
+    /* NOS3 simulation time (ICD 8.2): tick count on the time bus, converted as the NOS3 sims do */
+    const char *time_uri;
+    const char *time_bus;
+    double      start_time;  /* common.absolute-start-time, J2000 seconds */
+    long        us_per_tick; /* common.sim-microseconds-per-tick */
     int         verbose;
 } hil_config_t;
 
@@ -71,32 +89,42 @@ typedef struct
 
 static volatile sig_atomic_t keep_running = 1;
 
+/* Defaults match cfg/sims/sc-1-nos3-simulator.xml and the ICD port allocation (ICD 8.3) */
 static hil_config_t cfg = {
-    .serial_dev    = "/dev/ttyHIL0",
-    .baud          = 921600,
-    .nos_uri       = "tcp://nos-engine-server:12000",
-    .radio_host    = "radio-sim",
-    .ci_port       = 5010,
-    .to_port       = 5011,
-    .radio_rx_port = 5015,
-    .radio_tx_port = 5014,
-    .verbose       = 0,
+    .serial_dev  = "/dev/ttyHIL0",
+    .baud        = 921600,
+    .nos_uri     = "tcp://nos-engine-server:12000",
+    .umb_host    = "cosmos",
+    .umb_tc_port = 9010,
+    .umb_tm_port = 9011,
+    .rf_host     = "flatsat-gs",
+    .rf_rx_port  = 9020,
+    .rf_tx_port  = 9021,
+    .trq_host    = "trq-sim",
+    .trq_port    = 14242,
+    .time_uri    = "tcp://nos-engine-server:12001",
+    .time_bus    = "command",
+    .start_time  = 814254200.0,
+    .us_per_tick = 10000,
+    .verbose     = 0,
 };
 
 static NE_TransportHub *hub = NULL;
+static NE_Bus          *time_bus = NULL;
 static NE_Uart         *uart_dev[HIL_NUM_BUSES];
 static NE_I2CHandle    *i2c_dev[HIL_NUM_BUSES];
 static NE_SpiHandle    *spi_dev[HIL_NUM_BUSES];
 static NE_CanHandle    *can_dev[HIL_NUM_BUSES];
 
-static int serial_fd   = -1;
-static int ci_sock     = -1;
-static int radio_sock  = -1;
-static int tx_sock     = -1;
+static int serial_fd = -1;
+static int umb_sock  = -1;
+static int rf_sock   = -1;
+static int tx_sock   = -1;
 static uint8_t bridge_seq = 0;
 
-static hil_udp_dest_t to_dest;
-static hil_udp_dest_t radio_dest;
+static hil_udp_dest_t umb_dest;
+static hil_udp_dest_t rf_dest;
+static hil_udp_dest_t trq_dest;
 
 /* Frame buffers are large; keep them off the stack */
 static hil_frame_t rx_frame;
@@ -464,6 +492,62 @@ static void poll_uarts(void)
 }
 
 /*
+** Magnetorquers: the torquer sim isn't on a NOS Engine bus; hwlib's libtrq sends it UDP text
+** "<index> <duty %>\n" with a signed duty, so the bridge sends exactly that
+*/
+#define HIL_NUM_TORQUERS 3
+
+static void handle_trq(const hil_frame_t *f)
+{
+    char    msg[64];
+    int16_t duty;
+    int     n;
+
+    if (f->len != 2 || f->bus >= HIL_NUM_TORQUERS)
+    {
+        log_msg("TRQ_CMD: bad request (torquer %u, %u payload bytes)", f->bus, f->len);
+        return;
+    }
+    duty = (int16_t)hil_get_u16(f->payload);
+    if (duty < -HIL_TRQ_MAX_DUTY || duty > HIL_TRQ_MAX_DUTY)
+    {
+        log_msg("TRQ_CMD: duty %d out of range", duty);
+        return;
+    }
+    n = snprintf(msg, sizeof(msg), "%u %f\n", f->bus, duty / 100.0);
+    udp_send(&trq_dest, (const uint8_t *)msg, (size_t)n);
+}
+
+/*
+** Simulation time: tick count from the NOS3 time bus, converted the way the NOS3 sims do
+** (absolute-start-time + ticks * sim-microseconds-per-tick), sent as CUC seconds + 2^-16 subseconds
+*/
+static void send_time(void)
+{
+    NE_SimTime ticks;
+    double     t;
+    uint32_t   sec;
+    uint16_t   sub;
+    uint8_t    p[6];
+
+    if (time_bus == NULL)
+    {
+        return;
+    }
+    ticks = NE_bus_get_time(time_bus);
+    t     = cfg.start_time + (double)ticks * (double)cfg.us_per_tick / 1e6;
+    sec   = (uint32_t)t;
+    sub   = (uint16_t)((t - (double)sec) * 65536.0);
+
+    p[0] = (uint8_t)(sec & 0xFF);
+    p[1] = (uint8_t)((sec >> 8) & 0xFF);
+    p[2] = (uint8_t)((sec >> 16) & 0xFF);
+    p[3] = (uint8_t)((sec >> 24) & 0xFF);
+    hil_put_u16(&p[4], sub);
+    serial_send(HIL_TIME, 0, bridge_seq++, HIL_STATUS_OK, 0, p, sizeof(p));
+}
+
+/*
 ** Request handling
 */
 
@@ -602,11 +686,15 @@ static void handle_frame(const hil_frame_t *f)
             break;
 
         case HIL_TO_PKT:
-            udp_send(&to_dest, f->payload, f->len);
+            udp_send(&umb_dest, f->payload, f->len);
             break;
 
-        case HIL_RADIO_TX:
-            udp_send(&radio_dest, f->payload, f->len);
+        case HIL_RF_TX:
+            udp_send(&rf_dest, f->payload, f->len);
+            break;
+
+        case HIL_TRQ_CMD:
+            handle_trq(f);
             break;
 
         default:
@@ -651,16 +739,24 @@ static void usage(const char *prog)
     printf("Usage: %s [options]\n"
            "  -d, --device PATH        serial device (default %s)\n"
            "  -b, --baud RATE          baud rate (default %d)\n"
-           "  -n, --nos-uri URI        NOS Engine server (default %s)\n"
-           "  -r, --radio-host HOST    radio sim host (default %s)\n"
+           "  -n, --nos-uri URI        NOS Engine server for device buses (default %s)\n"
            "  -u, --uart N             open usart_N at startup (repeatable)\n"
-           "      --ci-port P          UDP listen port for commands (default %d)\n"
-           "      --to-port P          UDP port on radio host for telemetry (default %d)\n"
-           "      --radio-rx-port P    UDP listen port for radio traffic (default %d)\n"
-           "      --radio-tx-port P    UDP port on radio host for radio commands (default %d)\n"
+           "      --umb-host HOST      umbilical telemetry destination, COSMOS (default %s)\n"
+           "      --umb-tc-port P      UDP listen port for umbilical telecommands (default %d)\n"
+           "      --umb-tm-port P      UDP port for umbilical telemetry (default %d)\n"
+           "      --rf-host HOST       ground station link emulator (default %s)\n"
+           "      --rf-rx-port P       UDP listen port for RF frames to the MCU (default %d)\n"
+           "      --rf-tx-port P       UDP port for RF frames from the MCU (default %d)\n"
+           "      --trq-host HOST      magnetorquer sim (default %s)\n"
+           "      --trq-port P         magnetorquer sim UDP port (default %d)\n"
+           "      --time-uri URI       NOS Engine server for the time bus, \"none\" to disable (default %s)\n"
+           "      --time-bus NAME      time bus name (default %s)\n"
+           "      --start-time S       absolute-start-time, J2000 seconds (default %.1f)\n"
+           "      --us-per-tick N      sim-microseconds-per-tick (default %ld)\n"
            "  -v, --verbose            log every frame\n",
-           prog, cfg.serial_dev, cfg.baud, cfg.nos_uri, cfg.radio_host, cfg.ci_port, cfg.to_port,
-           cfg.radio_rx_port, cfg.radio_tx_port);
+           prog, cfg.serial_dev, cfg.baud, cfg.nos_uri, cfg.umb_host, cfg.umb_tc_port, cfg.umb_tm_port,
+           cfg.rf_host, cfg.rf_rx_port, cfg.rf_tx_port, cfg.trq_host, cfg.trq_port, cfg.time_uri, cfg.time_bus,
+           cfg.start_time, cfg.us_per_tick);
 }
 
 int main(int argc, char *argv[])
@@ -669,12 +765,19 @@ int main(int argc, char *argv[])
         {"device", required_argument, NULL, 'd'},
         {"baud", required_argument, NULL, 'b'},
         {"nos-uri", required_argument, NULL, 'n'},
-        {"radio-host", required_argument, NULL, 'r'},
         {"uart", required_argument, NULL, 'u'},
-        {"ci-port", required_argument, NULL, 1},
-        {"to-port", required_argument, NULL, 2},
-        {"radio-rx-port", required_argument, NULL, 3},
-        {"radio-tx-port", required_argument, NULL, 4},
+        {"umb-host", required_argument, NULL, 1},
+        {"umb-tc-port", required_argument, NULL, 2},
+        {"umb-tm-port", required_argument, NULL, 3},
+        {"rf-host", required_argument, NULL, 4},
+        {"rf-rx-port", required_argument, NULL, 5},
+        {"rf-tx-port", required_argument, NULL, 6},
+        {"trq-host", required_argument, NULL, 7},
+        {"trq-port", required_argument, NULL, 8},
+        {"time-uri", required_argument, NULL, 9},
+        {"time-bus", required_argument, NULL, 10},
+        {"start-time", required_argument, NULL, 11},
+        {"us-per-tick", required_argument, NULL, 12},
         {"verbose", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}};
@@ -683,30 +786,38 @@ int main(int argc, char *argv[])
     int           num_preopen = 0;
     int           opt;
     int           i;
+    time_t        last_time_sent = 0;
     hil_decoder_t dec;
     struct pollfd fds[3];
     struct sigaction sa;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    while ((opt = getopt_long(argc, argv, "d:b:n:r:u:vh", long_opts, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "d:b:n:u:vh", long_opts, NULL)) != -1)
     {
         switch (opt)
         {
             case 'd': cfg.serial_dev = optarg; break;
             case 'b': cfg.baud = atoi(optarg); break;
             case 'n': cfg.nos_uri = optarg; break;
-            case 'r': cfg.radio_host = optarg; break;
             case 'u':
                 if (num_preopen < HIL_NUM_BUSES)
                 {
                     preopen[num_preopen++] = atoi(optarg);
                 }
                 break;
-            case 1: cfg.ci_port = atoi(optarg); break;
-            case 2: cfg.to_port = atoi(optarg); break;
-            case 3: cfg.radio_rx_port = atoi(optarg); break;
-            case 4: cfg.radio_tx_port = atoi(optarg); break;
+            case 1: cfg.umb_host = optarg; break;
+            case 2: cfg.umb_tc_port = atoi(optarg); break;
+            case 3: cfg.umb_tm_port = atoi(optarg); break;
+            case 4: cfg.rf_host = optarg; break;
+            case 5: cfg.rf_rx_port = atoi(optarg); break;
+            case 6: cfg.rf_tx_port = atoi(optarg); break;
+            case 7: cfg.trq_host = optarg; break;
+            case 8: cfg.trq_port = atoi(optarg); break;
+            case 9: cfg.time_uri = optarg; break;
+            case 10: cfg.time_bus = optarg; break;
+            case 11: cfg.start_time = atof(optarg); break;
+            case 12: cfg.us_per_tick = atol(optarg); break;
             case 'v': cfg.verbose = 1; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
@@ -718,20 +829,23 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    to_dest.name    = cfg.radio_host;
-    to_dest.port    = cfg.to_port;
-    radio_dest.name = cfg.radio_host;
-    radio_dest.port = cfg.radio_tx_port;
+    umb_dest.name = cfg.umb_host;
+    umb_dest.port = cfg.umb_tm_port;
+    rf_dest.name  = cfg.rf_host;
+    rf_dest.port  = cfg.rf_tx_port;
+    trq_dest.name = cfg.trq_host;
+    trq_dest.port = cfg.trq_port;
 
-    log_msg("serial %s @ %d, NOS Engine %s, radio %s (CI in %d, TO out %d, radio in %d, radio out %d)",
-            cfg.serial_dev, cfg.baud, cfg.nos_uri, cfg.radio_host, cfg.ci_port, cfg.to_port,
-            cfg.radio_rx_port, cfg.radio_tx_port);
+    log_msg("serial %s @ %d, device buses %s", cfg.serial_dev, cfg.baud, cfg.nos_uri);
+    log_msg("umbilical: TC in :%d, TM out %s:%d", cfg.umb_tc_port, cfg.umb_host, cfg.umb_tm_port);
+    log_msg("RF link:   in :%d, out %s:%d", cfg.rf_rx_port, cfg.rf_host, cfg.rf_tx_port);
+    log_msg("torquers:  %s:%d; time: bus '%s' on %s", cfg.trq_host, cfg.trq_port, cfg.time_bus, cfg.time_uri);
 
-    serial_fd  = serial_open(cfg.serial_dev, cfg.baud);
-    ci_sock    = udp_bind(cfg.ci_port);
-    radio_sock = udp_bind(cfg.radio_rx_port);
-    tx_sock    = socket(AF_INET, SOCK_DGRAM, 0);
-    if (serial_fd < 0 || ci_sock < 0 || radio_sock < 0 || tx_sock < 0)
+    serial_fd = serial_open(cfg.serial_dev, cfg.baud);
+    umb_sock  = udp_bind(cfg.umb_tc_port);
+    rf_sock   = udp_bind(cfg.rf_rx_port);
+    tx_sock   = socket(AF_INET, SOCK_DGRAM, 0);
+    if (serial_fd < 0 || umb_sock < 0 || rf_sock < 0 || tx_sock < 0)
     {
         return 1;
     }
@@ -741,6 +855,15 @@ int main(int argc, char *argv[])
     {
         log_msg("failed to create NOS Engine transport hub");
         return 1;
+    }
+
+    if (strcmp(cfg.time_uri, "none") != 0)
+    {
+        time_bus = NE_create_bus(hub, cfg.time_bus, cfg.time_uri);
+        if (time_bus == NULL)
+        {
+            log_msg("warning: cannot join time bus '%s' on %s; TIME frames disabled", cfg.time_bus, cfg.time_uri);
+        }
     }
 
     for (i = 0; i < num_preopen; i++)
@@ -756,9 +879,9 @@ int main(int argc, char *argv[])
     hil_decoder_init(&dec);
     fds[0].fd     = serial_fd;
     fds[0].events = POLLIN;
-    fds[1].fd     = ci_sock;
+    fds[1].fd     = umb_sock;
     fds[1].events = POLLIN;
-    fds[2].fd     = radio_sock;
+    fds[2].fd     = rf_sock;
     fds[2].events = POLLIN;
 
     log_msg("running, waiting for MCU");
@@ -784,15 +907,22 @@ int main(int argc, char *argv[])
             }
             if (fds[1].revents & POLLIN)
             {
-                udp_to_mcu(ci_sock, HIL_CI_PKT);
+                udp_to_mcu(umb_sock, HIL_CI_PKT);
             }
             if (fds[2].revents & POLLIN)
             {
-                udp_to_mcu(radio_sock, HIL_RADIO_RX);
+                udp_to_mcu(rf_sock, HIL_RF_RX);
             }
         }
 
         poll_uarts();
+
+        /* Only while the MCU is talking: writes to a serial device nobody reads can block */
+        if (mcu_link_up && time(NULL) - last_time_sent >= HIL_TIME_PERIOD_S)
+        {
+            last_time_sent = time(NULL);
+            send_time();
+        }
 
         if (mcu_link_up && time(NULL) - last_mcu_frame > HIL_LINK_TIMEOUT_S)
         {
@@ -803,10 +933,14 @@ int main(int argc, char *argv[])
 
     log_msg("shutting down");
     close_buses();
+    if (time_bus != NULL)
+    {
+        NE_destroy_bus(&time_bus);
+    }
     NE_destroy_transport_hub(&hub);
     close(serial_fd);
-    close(ci_sock);
-    close(radio_sock);
+    close(umb_sock);
+    close(rf_sock);
     close(tx_sock);
     return 0;
 }

@@ -4,18 +4,23 @@ Hardware-in-the-loop bridge that lets an external microcontroller act as the NOS
 
 The bridge takes the place of the cFS container (`nos-fsw`) on the spacecraft network. The MCU talks to the bridge over a serial port, and the bridge acts on the MCU's behalf:
 - it performs bus transactions against the NOS3 device sims over NOS Engine, using the same bus names, node name and master address as `fsw/apps/hwlib/sim`;
-- it relays command and telemetry packets to and from the radio sim.
+- it drives the magnetorquer sim over UDP, the same way `hwlib`'s `libtrq` does;
+- it forwards NOS3 simulation time to the MCU once a second;
+- it relays umbilical telemetry and telecommands to and from COSMOS, and, in software-in-the-loop runs, RF frames to and from the ground station link emulator.
 
-The device sims, 42, the radio sim, CryptoLib and the ground software are unchanged.
+The device sims and 42 are unchanged. The NOS3 radio sim and CryptoLib are not used: they're built around cFS's 1786-byte encrypted transfer frames, which don't fit the FlatSat's 255-byte LoRa link (HITL FlatSat ICD, DD-03).
 
 ```
 MCU (your FSW) ──USB serial, hil_link frames──> nos3-hil-bridge  (container: -h nos-fsw)
                                                   ├─ NOS Engine tcp://nos-engine-server:12000
                                                   │    usart_N / i2c_N / spi_N / can_N ──> device sims ──> 42
-                                                  └─ UDP ──> radio-sim ──> cryptolib ──> COSMOS
-                                                       CI in :5010   TO out radio-sim:5011
-                                                       radio in :5015  radio out radio-sim:5014
+                                                  ├─ NOS Engine tcp://nos-engine-server:12001, bus "command" ──> TIME frames
+                                                  ├─ UDP ──> trq-sim:14242 (magnetorquers)
+                                                  ├─ UDP ──> COSMOS umbilical: TC in :9010, TM out cosmos:9011
+                                                  └─ UDP ──> ground link emulator: RF in :9020, RF out flatsat-gs:9021
 ```
+
+The interfaces are specified in the project's interface control document (`docs/icd/ICD.md` in the `hitl-flatsat` repo, IF-01/IF-02 and section 8).
 
 ## Layout
 
@@ -26,7 +31,7 @@ MCU (your FSW) ──USB serial, hil_link frames──> nos3-hil-bridge  (contai
 | `mcu/hil_mcu_example.c` | MCU-side example: I2C transactions, UART writes, telemetry downlink, command dispatch, EPS polling. |
 | `support/hil_link.py` | Python codec for the same protocol. |
 | `support/hil_fake_mcu.py` | Pretends to be the MCU, for testing without hardware. |
-| `support/e2e_test.sh` | Self-contained end-to-end test: engine server, EPS and sample sims, bridge and fake MCU. |
+| `support/e2e_test.sh` | Self-contained end-to-end test: engine server, time driver, EPS and sample sims, stand-in EGSE endpoints, bridge and fake MCU. |
 
 ## Protocol
 
@@ -46,9 +51,13 @@ type u8 | bus u8 | seq u8 | status u8 | addr u32 LE | payload | crc16 LE   (CRC-
 | `I2C_TXN` / `I2C_RSP` 0x20/0x21 | MCU→ / →MCU | bus = N of `i2c_N`, addr = 7-bit address | request: `rxlen u16 LE` + tx bytes; response: rx bytes |
 | `SPI_TXN` / `SPI_RSP` 0x30/0x31 | MCU→ / →MCU | bus, addr = chip select. NOS bus is `spi_<bus*10+cs>`, as in hwlib. | same as I2C |
 | `CAN_TXN` / `CAN_RSP` 0x40/0x41 | MCU→ / →MCU | bus = N of `can_N`, addr = CAN id | same as I2C. The bytes are passed through unchanged, so send what hwlib `libcan` sends. |
-| `CI_PKT` 0x50 | →MCU | – | uplinked command packet |
-| `TO_PKT` 0x51 | MCU→ | – | telemetry packet for the ground |
-| `RADIO_RX` / `RADIO_TX` 0x52/0x53 | →MCU / MCU→ | – | radio device traffic |
+| `CI_PKT` 0x50 | →MCU | – | umbilical telecommand: one space packet from COSMOS |
+| `TO_PKT` 0x51 | MCU→ | – | umbilical telemetry: one space packet for COSMOS |
+| `RF_TX` / `RF_RX` 0x54/0x55 | MCU→ / →MCU | – | software-in-the-loop only: RF frames to and from the ground station link emulator |
+| `TRQ_CMD` 0x60 | MCU→ | bus = torquer 0–2 | duty `i16` LE in 0.01 % (−10000…10000), sent to the torquer sim as `"<n> <duty %>\n"` |
+| `TIME` 0x61 | →MCU | – | NOS3 simulation time, 1 Hz while the link is up: seconds `u32` LE + subseconds `u16` LE (CUC, J2000) |
+
+Types 0x52/0x53 are reserved; they carried NOS3 radio sim traffic before ICD v1.
 
 Responses echo the request's `seq`. `status` is one of:
 - 0 OK
@@ -93,7 +102,8 @@ gcc -std=c99 -Wall -Wextra -Icomponents/hil_bridge/protocol \
     components/hil_bridge/protocol/test_hil_link.c components/hil_bridge/protocol/hil_link.c -o /tmp/t && /tmp/t
 
 # End-to-end: bridge + real EPS/sample sims + fake MCU over a pty (from the NOS3 root, after make sim)
-docker run --rm -v $PWD:$PWD --add-host nos-engine-server:127.0.0.1 ivvitc/nos3-64:20260619 \
+docker run --rm -v $PWD:$PWD --add-host nos-engine-server:127.0.0.1 \
+    --add-host sc01-nos-engine-server:127.0.0.1 ivvitc/nos3-64:20260619 \
     $PWD/components/hil_bridge/support/e2e_test.sh
 ```
 
@@ -101,7 +111,7 @@ The fake MCU can also be pointed at a running bridge through any pty or serial d
 
 ## Limitations
 
-- **The COSMOS DEBUG interface doesn't work.** It talks directly to ci_lab/to_lab on `nos-fsw:5012/5013`, and the bridge doesn't serve those ports. The RADIO path through the radio sim works.
+- **The cFS COSMOS interfaces don't apply.** COSMOS's DEBUG and RADIO interfaces talk to cFS apps; the FlatSat uses its own `FLATSAT_UMB` and `FLATSAT_RF` interfaces instead (ICD §3.6).
 - **The bridge is sequential.** Like hwlib, NOS Engine transactions block the bridge and have no timeout. If the engine server dies mid-transaction, the bridge hangs; a second Ctrl-C or `docker stop` exits it.
 - **The MCU runs on its own clock.** NOS3 runs in real time by default (`sim-microseconds-per-tick` equals `real-microseconds-per-tick`). The MCU doesn't receive NOS time ticks, so keep the sim at 1:1 speed.
 - **Large packets are dropped.** Packets over `HIL_MAX_PAYLOAD` (2048 bytes by default) are dropped with a log message. If you shrink it on the MCU to save RAM, keep it at least as large as your biggest telemetry packet.

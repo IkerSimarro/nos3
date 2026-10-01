@@ -1,11 +1,13 @@
 #!/bin/bash
 #
 # End-to-end test of the HIL bridge without hardware or the full NOS3 launch.
-# Starts a NOS Engine server, the real EPS and sample sims (with built-in data providers instead of 42),
-# a stand-in radio sim, the bridge, and the fake MCU over a pty, then runs the fake MCU self-test.
+# Starts a NOS Engine server, the NOS3 time driver, the real EPS and sample sims (with built-in data
+# providers instead of 42), stand-in EGSE endpoints (COSMOS umbilical, ground link emulator, torquer
+# sim), the bridge, and the fake MCU over a pty, then runs the fake MCU self-test.
 #
 # Run from the NOS3 root after `make config && make sim`:
-#   docker run --rm -v $PWD:$PWD --add-host nos-engine-server:127.0.0.1 ivvitc/nos3-64:20260619 \
+#   docker run --rm -v $PWD:$PWD --add-host nos-engine-server:127.0.0.1 \
+#       --add-host sc01-nos-engine-server:127.0.0.1 ivvitc/nos3-64:20260619 \
 #       $PWD/components/hil_bridge/support/e2e_test.sh
 #
 HERE=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
@@ -39,21 +41,40 @@ sleep 1
 (cd $WORK && $SIM_BIN/nos3-single-simulator -f $WORK/sim.xml generic-eps-sim > $WORK/eps.log 2>&1) &
 (cd $WORK && $SIM_BIN/nos3-single-simulator -f $WORK/sim.xml sample-sim > $WORK/sample.log 2>&1) &
 
-# Stand-in radio sim: answer the first telemetry packet with a command packet
-python3 - > $WORK/radio.log 2>&1 <<'EOF' &
-import socket
-rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-rx.bind(("0.0.0.0", 5011))
-data, _ = rx.recvfrom(65536)
-print("radio got", data)
-if data == b"tlm-test":
-    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"cmd-test", ("127.0.0.1", 5010))
-EOF
+# The real NOS3 time driver, so TIME frames carry advancing simulation time
+# It draws a curses screen, so it needs a terminal: `script` provides a pseudo-terminal
+(cd $WORK && sleep infinity | TERM=xterm script -qfec "$SIM_BIN/nos3-single-simulator -f $WORK/sim.xml time" \
+    /dev/null > $WORK/time.log 2>&1) &
 
-python3 $HERE/hil_fake_mcu.py --pty $WORK/tty --test --check-uart --check-radio --wait 30 &
+# Stand-ins for the EGSE endpoints (COSMOS umbilical, ground link emulator, torquer sim):
+# each answers the fake MCU's test message so both directions are checked
+python3 - > $WORK/egse.log 2>&1 <<'EOF2' &
+import selectors, socket
+def bind(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", port))
+    return s
+out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+umb, rf, trq = bind(9011), bind(9021), bind(14242)
+sel = selectors.DefaultSelector()
+for s in (umb, rf, trq):
+    sel.register(s, selectors.EVENT_READ)
+while True:
+    for key, _ in sel.select():
+        data, _ = key.fileobj.recvfrom(65536)
+        print("got", key.fileobj.getsockname()[1], data, flush=True)
+        if key.fileobj is umb and data == b"umb-tm-test":
+            out.sendto(b"umb-tc-test", ("127.0.0.1", 9010))
+        elif key.fileobj is rf and data == b"rf-tx-test":
+            out.sendto(b"rf-rx-test", ("127.0.0.1", 9020))
+        elif key.fileobj is trq:
+            out.sendto(b"trq:" + data, ("127.0.0.1", 9010))
+EOF2
+
+python3 $HERE/hil_fake_mcu.py --pty $WORK/tty --test --check-uart --check-egse --check-time --wait 30 &
 FAKE=$!
 sleep 1
-$BRIDGE -d $WORK/tty -r 127.0.0.1 -v > $WORK/bridge.log 2>&1 &
+$BRIDGE -d $WORK/tty --umb-host 127.0.0.1 --rf-host 127.0.0.1 --trq-host 127.0.0.1 -v > $WORK/bridge.log 2>&1 &
 
 wait $FAKE
 RC=$?
@@ -65,8 +86,10 @@ if [ $RC -ne 0 ]; then
     tail -20 $WORK/eps.log
     echo "---- sample sim log ----"
     tail -20 $WORK/sample.log
-    echo "---- radio log ----"
-    cat $WORK/radio.log
+    echo "---- time driver log ----"
+    tail -20 $WORK/time.log
+    echo "---- EGSE stand-in log ----"
+    cat $WORK/egse.log
 fi
 echo
 [ $RC -eq 0 ] && echo "E2E RESULT: PASS" || echo "E2E RESULT: FAIL"

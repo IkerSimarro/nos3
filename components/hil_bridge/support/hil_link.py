@@ -18,8 +18,10 @@ CAN_TXN = 0x40
 CAN_RSP = 0x41
 CI_PKT = 0x50
 TO_PKT = 0x51
-RADIO_RX = 0x52
-RADIO_TX = 0x53
+RF_TX = 0x54
+RF_RX = 0x55
+TRQ_CMD = 0x60
+TIME = 0x61
 
 TYPE_NAMES = {v: k for k, v in globals().items() if k.isupper() and isinstance(v, int)}
 

@@ -51,10 +51,15 @@ typedef enum
     HIL_CAN_TXN   = 0x40, /* MCU->  : payload = rxlen u16 LE | tx bytes; addr = CAN identifier */
     HIL_CAN_RSP   = 0x41, /* ->MCU  : payload = rx bytes, status set */
 
-    HIL_CI_PKT    = 0x50, /* ->MCU  : uplinked command packet (radio sim -> nos-fsw:5010) */
-    HIL_TO_PKT    = 0x51, /* MCU->  : telemetry packet (-> radio-sim:5011) */
-    HIL_RADIO_RX  = 0x52, /* ->MCU  : radio device traffic (radio sim -> nos-fsw:5015) */
-    HIL_RADIO_TX  = 0x53  /* MCU->  : radio device command (-> radio-sim:5014) */
+    HIL_CI_PKT    = 0x50, /* ->MCU  : umbilical telecommand, one space packet from the EGSE */
+    HIL_TO_PKT    = 0x51, /* MCU->  : umbilical telemetry, one space packet to the EGSE */
+    /* 0x52, 0x53: reserved (formerly NOS3 radio sim traffic, removed in ICD v1) */
+    HIL_RF_TX     = 0x54, /* MCU->  : SIL only, RF frame for the ground station link emulator */
+    HIL_RF_RX     = 0x55, /* ->MCU  : SIL only, RF frame from the ground station link emulator; also
+                             used by the ground modem, with RSSI/SNR packed into addr */
+
+    HIL_TRQ_CMD   = 0x60, /* MCU->  : magnetorquer bus = index, payload = duty i16 LE in 0.01 % */
+    HIL_TIME      = 0x61  /* ->MCU  : NOS3 simulation time, payload = seconds u32 LE, subseconds u16 LE */
 } hil_type_t;
 
 typedef enum

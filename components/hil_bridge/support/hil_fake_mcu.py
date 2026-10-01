@@ -26,6 +26,8 @@ EPS_I2C_BUS = 1
 EPS_I2C_ADDR = 0x2B
 EPS_HK_LEN = 16 + 8 * 6  # 8 uint16 fields + 8 switches of 3 uint16 (generic_eps_device.h)
 
+START_TIME = 814254200  # absolute-start-time in cfg/sims (J2000 s)
+
 SAMPLE_UART_BUS = 16
 SAMPLE_NOOP_CMD = bytes([0xDE, 0xAD, 0x00, 0, 0, 0, 0, 0xBE, 0xEF])  # components/sample/fsw/shared/sample_device.c
 
@@ -85,7 +87,7 @@ class Link:
         return None
 
 
-def test(link: Link, wait: float, check_radio: bool, check_uart: bool) -> bool:
+def test(link: Link, wait: float, check_egse: bool, check_uart: bool, check_time: bool) -> bool:
     ok = True
 
     # The bridge may still be starting; keep pinging until it answers
@@ -139,18 +141,51 @@ def test(link: Link, wait: float, check_radio: bool, check_uart: bool) -> bool:
             print(f"FAIL UART path: received {echo.hex() or 'nothing'} on usart_16")
             ok = False
 
-    if check_radio:
-        # Expects something on the radio host that answers our telemetry with a command,
-        # e.g. the stand-in radio in e2e_test.sh; the real radio sim won't do this
-        link.send(hil_link.Frame(hil_link.TO_PKT, payload=b"tlm-test"))
-        ci = next((f for f in link.recv(5.0) if f.type == hil_link.CI_PKT), None)
-        if ci is not None and ci.payload == b"cmd-test":
-            print("PASS radio path: TO_PKT reached radio host, CI_PKT came back")
-        else:
-            print(f"FAIL radio path: got {ci}")
-            ok = False
+    if check_egse:
+        # These need the stand-in EGSE endpoints from e2e_test.sh, which answer each message
+        ok &= expect_reply(link, hil_link.Frame(hil_link.TO_PKT, payload=b"umb-tm-test"),
+                           hil_link.CI_PKT, b"umb-tc-test", "umbilical: TO_PKT out, CI_PKT back")
+        ok &= expect_reply(link, hil_link.Frame(hil_link.RF_TX, payload=b"rf-tx-test"),
+                           hil_link.RF_RX, b"rf-rx-test", "RF link: RF_TX out, RF_RX back")
+        # The stand-in torquer sim reports the text it received as an umbilical command
+        ok &= expect_reply(link, hil_link.Frame(hil_link.TRQ_CMD, bus=1, payload=struct.pack("<h", -2500)),
+                           hil_link.CI_PKT, b"trq:1 -25.000000\n", "torquer: TRQ_CMD -25 % on torquer 1")
+
+    if check_time:
+        ok &= check_time_frames(link)
 
     return ok
+
+
+def expect_reply(link: Link, frame: hil_link.Frame, reply_type: int, expected: bytes, what: str) -> bool:
+    link.send(frame)
+    got = next((f for f in link.recv(5.0) if f.type == reply_type), None)
+    if got is not None and got.payload == expected:
+        print(f"PASS {what}")
+        return True
+    print(f"FAIL {what}: got {got.payload if got else 'nothing'}")
+    return False
+
+
+def check_time_frames(link: Link) -> bool:
+    """TIME frames arrive once a second while the link is up and must advance with the NOS3 clock."""
+    times = []
+    deadline = time.monotonic() + 4.5
+    while time.monotonic() < deadline:
+        link.send(hil_link.Frame(hil_link.HEARTBEAT))  # keep the link up
+        for f in link.recv(0.5):
+            if f.type == hil_link.TIME and len(f.payload) == 6:
+                sec, sub = struct.unpack("<IH", f.payload)
+                times.append(sec + sub / 65536.0)
+    if len(times) < 3:
+        print(f"FAIL simulation time: {len(times)} TIME frames in 4.5 s")
+        return False
+    steps = [b - a for a, b in zip(times, times[1:])]
+    if times[0] < START_TIME or not all(0.5 < s < 1.5 for s in steps):
+        print(f"FAIL simulation time: {times[0]:.2f} s, steps {[round(s, 3) for s in steps]}")
+        return False
+    print(f"PASS simulation time: J2000 {times[0]:.2f} s, advancing {[round(s, 2) for s in steps]} s per frame")
+    return True
 
 
 def listen(link: Link):
@@ -173,8 +208,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("device", nargs="?", help="serial device or pty connected to the bridge")
     parser.add_argument("--pty", metavar="LINK", help="create a pty pair and symlink the bridge end to LINK")
-    parser.add_argument("--check-radio", action="store_true",
-                        help="also test the TO/CI UDP path (needs a responder on the radio host)")
+    parser.add_argument("--check-egse", action="store_true",
+                        help="also test umbilical, RF and torquer paths (needs the e2e_test.sh stand-ins)")
+    parser.add_argument("--check-time", action="store_true",
+                        help="also check TIME frames advance (needs the NOS3 time driver)")
     parser.add_argument("--check-uart", action="store_true",
                         help="also test usart_16 against the sample sim")
     parser.add_argument("--wait", type=float, default=30.0, help="seconds to wait for the bridge (--test)")
@@ -187,7 +224,7 @@ def main():
 
     link = Link(args.device, args.pty)
     if args.test:
-        sys.exit(0 if test(link, args.wait, args.check_radio, args.check_uart) else 1)
+        sys.exit(0 if test(link, args.wait, args.check_egse, args.check_uart, args.check_time) else 1)
     listen(link)
 
 
