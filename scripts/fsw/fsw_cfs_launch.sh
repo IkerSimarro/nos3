@@ -25,6 +25,23 @@ if [ ! -d $BASE_DIR/cfg/build ]; then
     exit 1
 fi
 
+# Hardware-in-the-loop checks (HIL=1 make launch)
+if [ "${HIL:-0}" == "1" ]; then
+    HIL_SERIAL=${HIL_SERIAL:-/dev/ttyACM0}
+    if [ ! -e "$HIL_SERIAL" ]; then
+        echo ""
+        echo "    HIL serial device $HIL_SERIAL not found (on WSL2, attach it with usbipd first)"
+        echo ""
+        exit 1
+    fi
+    if [ ! -x $SIM_BIN/nos3-hil-bridge ]; then
+        echo ""
+        echo "    Need to run make sim to build nos3-hil-bridge!"
+        echo ""
+        exit 1
+    fi
+fi
+
 echo "Make data folders..."
 # FSW Side
 mkdir $FSW_DIR/data 2> /dev/null
@@ -102,12 +119,19 @@ do
     gnome-terminal --tab --title=$SC_NUM" - OnAIR" -- $DFLAGS -v $BASE_DIR:$BASE_DIR --name $SC_NUM"-onair" --network=$SC_NETNAME -w $FSW_DIR -t $DBOX $SCRIPT_DIR/fsw/onair_launch.sh
     echo ""
 
-    echo $SC_NUM " - Flight Software..."
-    cd $FSW_DIR
-    # Debugging
-    # Replace `--tab` with `--window-with-profile=KeepOpen` once you've created this gnome-terminal profile manually
-    gnome-terminal --title=$SC_NUM" - NOS3 Flight Software" -- $DFLAGS -v $BASE_DIR:$BASE_DIR --name $SC_NUM"-nos-fsw" -h nos-fsw --network=$SC_NETNAME -w $FSW_DIR --sysctl fs.mqueue.msg_max=10000 --ulimit rtprio=99 --cap-add=sys_nice $DBOX $SCRIPT_DIR/fsw/fsw_respawn.sh &
-    #gnome-terminal --window-with-profile=KeepOpen --title=$SC_NUM" - NOS3 Flight Software" -- $DFLAGS -v $BASE_DIR:$BASE_DIR --name $SC_NUM"-nos-fsw" -h nos-fsw --network=$SC_NETNAME -w $FSW_DIR --sysctl fs.mqueue.msg_max=10000 --ulimit rtprio=99 --cap-add=sys_nice $DBOX $FSW_DIR/core-cpu1 -R PO &
+    if [ "${HIL:-0}" == "1" ]; then
+        # Hardware-in-the-loop: an external MCU is the flight computer; the bridge takes the nos-fsw
+        # place on the network (see components/hil_bridge/README.md)
+        echo $SC_NUM " - HIL Bridge (flight software on MCU at $HIL_SERIAL)..."
+        gnome-terminal --title=$SC_NUM" - HIL Bridge" -- $DFLAGS -v $SIM_DIR:$SIM_DIR --name $SC_NUM"-nos-fsw" -h nos-fsw --network=$SC_NETNAME --network-alias nos-fsw --device $HIL_SERIAL:/dev/ttyHIL0 --group-add $(stat -c %g $HIL_SERIAL) -w $SIM_BIN $DBOX ./nos3-hil-bridge -d /dev/ttyHIL0 -b ${HIL_BAUD:-921600} $HIL_ARGS &
+    else
+        echo $SC_NUM " - Flight Software..."
+        cd $FSW_DIR
+        # Debugging
+        # Replace `--tab` with `--window-with-profile=KeepOpen` once you've created this gnome-terminal profile manually
+        gnome-terminal --title=$SC_NUM" - NOS3 Flight Software" -- $DFLAGS -v $BASE_DIR:$BASE_DIR --name $SC_NUM"-nos-fsw" -h nos-fsw --network=$SC_NETNAME -w $FSW_DIR --sysctl fs.mqueue.msg_max=10000 --ulimit rtprio=99 --cap-add=sys_nice $DBOX $SCRIPT_DIR/fsw/fsw_respawn.sh &
+        #gnome-terminal --window-with-profile=KeepOpen --title=$SC_NUM" - NOS3 Flight Software" -- $DFLAGS -v $BASE_DIR:$BASE_DIR --name $SC_NUM"-nos-fsw" -h nos-fsw --network=$SC_NETNAME -w $FSW_DIR --sysctl fs.mqueue.msg_max=10000 --ulimit rtprio=99 --cap-add=sys_nice $DBOX $FSW_DIR/core-cpu1 -R PO &
+    fi
     echo ""
 
     echo $SC_NUM " - Simulators..."
