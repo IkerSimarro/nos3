@@ -51,6 +51,7 @@ type u8 | bus u8 | seq u8 | status u8 | addr u32 LE | payload | crc16 LE   (CRC-
 | `I2C_TXN` / `I2C_RSP` 0x20/0x21 | MCU→ / →MCU | bus = N of `i2c_N`, addr = 7-bit address | request: `rxlen u16 LE` + tx bytes; response: rx bytes |
 | `SPI_TXN` / `SPI_RSP` 0x30/0x31 | MCU→ / →MCU | bus, addr = chip select. NOS bus is `spi_<bus*10+cs>`, as in hwlib. | same as I2C |
 | `CAN_TXN` / `CAN_RSP` 0x40/0x41 | MCU→ / →MCU | bus = N of `can_N`, addr = CAN id | same as I2C. The bytes are passed through unchanged, so send what hwlib `libcan` sends. |
+| `I2C_OPEN` / `SPI_OPEN` / `CAN_OPEN` 0x22/0x32/0x42 | MCU→ | as for the transactions | none. Opens the bus ahead of the first transaction: opening takes ~50 ms, which would otherwise count against that transaction's timeout. |
 | `CI_PKT` 0x50 | →MCU | – | umbilical telecommand: one space packet from COSMOS |
 | `TO_PKT` 0x51 | MCU→ | – | umbilical telemetry: one space packet for COSMOS |
 | `RF_TX` / `RF_RX` 0x54/0x55 | MCU→ / →MCU | – | software-in-the-loop only: RF frames to and from the ground station link emulator |

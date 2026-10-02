@@ -44,12 +44,15 @@ typedef enum
 
     HIL_I2C_TXN   = 0x20, /* MCU->  : payload = rxlen u16 LE | tx bytes; addr = 7-bit address */
     HIL_I2C_RSP   = 0x21, /* ->MCU  : payload = rx bytes, status set */
+    HIL_I2C_OPEN  = 0x22, /* MCU->  : open i2c_<bus> ahead of the first transaction (no reply) */
 
     HIL_SPI_TXN   = 0x30, /* MCU->  : payload = rxlen u16 LE | tx bytes; addr = chip select */
     HIL_SPI_RSP   = 0x31, /* ->MCU  : payload = rx bytes, status set */
+    HIL_SPI_OPEN  = 0x32, /* MCU->  : open the bus for (bus, chip select = addr) (no reply) */
 
     HIL_CAN_TXN   = 0x40, /* MCU->  : payload = rxlen u16 LE | tx bytes; addr = CAN identifier */
     HIL_CAN_RSP   = 0x41, /* ->MCU  : payload = rx bytes, status set */
+    HIL_CAN_OPEN  = 0x42, /* MCU->  : open can_<bus> (no reply) */
 
     HIL_CI_PKT    = 0x50, /* ->MCU  : umbilical telecommand, one space packet from the EGSE */
     HIL_TO_PKT    = 0x51, /* MCU->  : umbilical telemetry, one space packet to the EGSE */

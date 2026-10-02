@@ -144,6 +144,14 @@ static void log_msg(const char *fmt, ...)
     printf("\n");
 }
 
+/* Monotonic milliseconds, for timing how long NOS Engine takes to open a bus */
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
 /*
 ** NOS Engine transactions block with no timeout (e.g. if the server dies), so the main loop may never
 ** see keep_running go false; a second signal exits immediately.
@@ -363,7 +371,8 @@ static void udp_to_mcu(int fd, uint8_t type)
 */
 static NE_Uart *get_uart(uint8_t bus)
 {
-    char name[16];
+    char   name[16];
+    double t0;
 
     if (bus >= HIL_NUM_BUSES)
     {
@@ -372,6 +381,7 @@ static NE_Uart *get_uart(uint8_t bus)
     if (uart_dev[bus] == NULL)
     {
         snprintf(name, sizeof(name), "usart_%u", bus);
+        t0 = now_ms();
         uart_dev[bus] = NE_uart_open3(hub, HIL_NOS_NODE_NAME, cfg.nos_uri, name, bus);
         if (uart_dev[bus] == NULL)
         {
@@ -379,14 +389,15 @@ static NE_Uart *get_uart(uint8_t bus)
             return NULL;
         }
         NE_uart_set_queue_size(uart_dev[bus], HIL_USART_QUEUE_SIZE);
-        log_msg("opened %s", name);
+        log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
     return uart_dev[bus];
 }
 
 static NE_I2CHandle *get_i2c(uint8_t bus)
 {
-    char name[16];
+    char   name[16];
+    double t0;
 
     if (bus >= HIL_NUM_BUSES)
     {
@@ -395,13 +406,14 @@ static NE_I2CHandle *get_i2c(uint8_t bus)
     if (i2c_dev[bus] == NULL)
     {
         snprintf(name, sizeof(name), "i2c_%u", bus);
+        t0 = now_ms();
         i2c_dev[bus] = NE_i2c_init_master3(hub, HIL_NOS_MASTER_ADDR, cfg.nos_uri, name);
         if (i2c_dev[bus] == NULL)
         {
             log_msg("failed to open %s on %s", name, cfg.nos_uri);
             return NULL;
         }
-        log_msg("opened %s", name);
+        log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
     return i2c_dev[bus];
 }
@@ -409,6 +421,7 @@ static NE_I2CHandle *get_i2c(uint8_t bus)
 /* hwlib maps SPI (bus, cs) to NOS bus spi_<bus*10+cs> */
 static NE_SpiHandle *get_spi(uint8_t bus, uint8_t cs)
 {
+    double   t0;
     char     name[16];
     unsigned idx = (unsigned)bus * 10u + cs;
 
@@ -419,20 +432,22 @@ static NE_SpiHandle *get_spi(uint8_t bus, uint8_t cs)
     if (spi_dev[idx] == NULL)
     {
         snprintf(name, sizeof(name), "spi_%u", idx);
+        t0 = now_ms();
         spi_dev[idx] = NE_spi_init_master3(hub, cfg.nos_uri, name);
         if (spi_dev[idx] == NULL)
         {
             log_msg("failed to open %s on %s", name, cfg.nos_uri);
             return NULL;
         }
-        log_msg("opened %s", name);
+        log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
     return spi_dev[idx];
 }
 
 static NE_CanHandle *get_can(uint8_t bus)
 {
-    char name[16];
+    char   name[16];
+    double t0;
 
     if (bus >= HIL_NUM_BUSES)
     {
@@ -441,13 +456,14 @@ static NE_CanHandle *get_can(uint8_t bus)
     if (can_dev[bus] == NULL)
     {
         snprintf(name, sizeof(name), "can_%u", bus);
+        t0 = now_ms();
         can_dev[bus] = NE_can_init_master3(hub, HIL_NOS_MASTER_ADDR, cfg.nos_uri, name);
         if (can_dev[bus] == NULL)
         {
             log_msg("failed to open %s on %s", name, cfg.nos_uri);
             return NULL;
         }
-        log_msg("opened %s", name);
+        log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
     return can_dev[bus];
 }
@@ -662,10 +678,33 @@ static void handle_frame(const hil_frame_t *f)
             log_msg("MCU: %.*s", (int)f->len, (const char *)f->payload);
             break;
 
+        /* Opening a NOS Engine bus takes about 50 ms; the MCU opens its buses up front so the
+         * first transaction on each doesn't pay that against its timeout */
         case HIL_UART_OPEN:
             if (get_uart(f->bus) == NULL)
             {
                 log_msg("UART_OPEN: cannot open usart_%u", f->bus);
+            }
+            break;
+
+        case HIL_I2C_OPEN:
+            if (get_i2c(f->bus) == NULL)
+            {
+                log_msg("I2C_OPEN: cannot open i2c_%u", f->bus);
+            }
+            break;
+
+        case HIL_SPI_OPEN:
+            if (get_spi(f->bus, (uint8_t)f->addr) == NULL)
+            {
+                log_msg("SPI_OPEN: cannot open SPI bus %u chip select %u", f->bus, f->addr);
+            }
+            break;
+
+        case HIL_CAN_OPEN:
+            if (get_can(f->bus) == NULL)
+            {
+                log_msg("CAN_OPEN: cannot open can_%u", f->bus);
             }
             break;
 
