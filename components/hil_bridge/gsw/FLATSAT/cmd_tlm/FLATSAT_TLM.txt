@@ -46,7 +46,7 @@ TELEMETRY FLATSAT OBC_HK LITTLE_ENDIAN "OBC housekeeping"
   APPEND_ITEM CAN_TEC 8 UINT "MCP2515 transmit error counter"
   APPEND_ITEM CAN_REC 8 UINT "MCP2515 receive error counter"
   APPEND_ITEM EVENT_COUNT 16 UINT "Event count"
-  APPEND_ITEM SPARE 16 UINT "Spare"
+  APPEND_ITEM SENSOR_MISSES 16 UINT "Failed device reads since boot, including isolated misses below the fault persistence threshold"
 
 TELEMETRY FLATSAT BEACON LITTLE_ENDIAN "Compact health beacon, sent over RF every 10 s"
   APPEND_ID_ITEM CCSDS_STREAMID 16 UINT 0x0A01 "CCSDS packet identification" BIG_ENDIAN
