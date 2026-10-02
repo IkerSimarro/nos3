@@ -1,0 +1,6 @@
+
+# HITL FlatSat umbilical (appended by scripts/cfg/configure_cosmos_target.py): telecommands to the
+# HIL bridge on nos-fsw:9010, telemetry from it on port 9011 (FlatSat ICD 3.6)
+INTERFACE FLATSAT_UMB udp_interface.rb nos-fsw 9010 9011 nil nil 128 nil nil
+  PROTOCOL WRITE flatsat_checksum_protocol.rb
+  TARGET FLATSAT

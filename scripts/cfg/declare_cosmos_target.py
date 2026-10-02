@@ -52,6 +52,14 @@ def clean_declare_targets(input_file, output_file, sc_root, component_key, xml_n
     with open(output_file, 'w') as f:
         f.writelines(filtered_lines)
 
+
+def append_hitl_flatsat(output_path, snippet):
+    """HITL FlatSat: append the COSMOS snippet from components/hil_bridge/cosmos, if the component is present."""
+    path = './components/hil_bridge/cosmos/' + snippet
+    if os.path.isfile(path):
+        with open(path, 'r') as src, open(output_path, 'a') as dst:
+            dst.write(src.read())
+
 def main():
     # === Parse XML to get SC config ===
     mission_file = 'nos3-mission.xml'
@@ -78,6 +86,7 @@ def main():
     # Process each component
     for comp_key, xml_name in components.items():
         clean_declare_targets(output_path, output_path, sc_root, comp_key, xml_name)
+    append_hitl_flatsat(output_path, 'system.txt')
 
 if __name__ == '__main__':
     main()
