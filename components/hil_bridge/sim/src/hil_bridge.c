@@ -14,6 +14,11 @@
 **
 ** Bus handling mirrors fsw/apps/hwlib/sim/src (lib*.c, nos_link.c): buses are opened lazily on first
 ** use with the same bus names, node name and master address, so the device sims need no changes.
+**
+** Threads: the main thread owns the serial link, UDP, UART polling and TIME frames. Each I2C, SPI and CAN
+** bus has a worker thread that runs its transactions, because NOS Engine calls block until the simulator
+** answers (its timeouts default to infinite). A stalled simulator therefore holds only its own bus; a new
+** request for that bus is answered BUS_ERROR at once and every other bus carries on (FlatSat NCR-006).
 */
 #define _DEFAULT_SOURCE
 
@@ -22,6 +27,7 @@
 #include <getopt.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -130,6 +136,11 @@ static hil_udp_dest_t trq_dest;
 static hil_frame_t rx_frame;
 static hil_frame_t tx_frame;
 static uint8_t     tx_wire[HIL_ENCODED_MAX];
+
+/* serial_mu: tx_frame/tx_wire and the serial line, shared by the main thread and the bus workers.
+** open_mu: creation of NOS Engine bus handles, which the main thread (OPEN frames) and workers both do. */
+static pthread_mutex_t serial_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t open_mu   = PTHREAD_MUTEX_INITIALIZER;
 
 static time_t last_mcu_frame = 0;
 static int    mcu_link_up    = 0;
@@ -241,6 +252,7 @@ static void serial_send(uint8_t type, uint8_t bus, uint8_t seq, uint8_t status, 
         return;
     }
 
+    pthread_mutex_lock(&serial_mu);
     tx_frame.type   = type;
     tx_frame.bus    = bus;
     tx_frame.seq    = seq;
@@ -255,6 +267,7 @@ static void serial_send(uint8_t type, uint8_t bus, uint8_t seq, uint8_t status, 
     n = hil_encode(&tx_frame, tx_wire, sizeof(tx_wire));
     if (n == 0)
     {
+        pthread_mutex_unlock(&serial_mu);
         log_msg("failed to encode frame type 0x%02x", type);
         return;
     }
@@ -268,11 +281,13 @@ static void serial_send(uint8_t type, uint8_t bus, uint8_t seq, uint8_t status, 
             {
                 continue;
             }
+            pthread_mutex_unlock(&serial_mu);
             log_msg("serial write failed: %s", strerror(errno));
             return;
         }
         off += (size_t)w;
     }
+    pthread_mutex_unlock(&serial_mu);
 
     if (cfg.verbose)
     {
@@ -369,6 +384,14 @@ static void udp_to_mcu(int fd, uint8_t type)
 /*
 ** NOS Engine buses (lazy open, same as hwlib sim)
 */
+enum
+{
+    WORKER_I2C,
+    WORKER_SPI,
+    WORKER_CAN,
+    WORKER_KINDS
+};
+
 static NE_Uart *get_uart(uint8_t bus)
 {
     char   name[16];
@@ -378,6 +401,7 @@ static NE_Uart *get_uart(uint8_t bus)
     {
         return NULL;
     }
+    pthread_mutex_lock(&open_mu);
     if (uart_dev[bus] == NULL)
     {
         snprintf(name, sizeof(name), "usart_%u", bus);
@@ -385,12 +409,17 @@ static NE_Uart *get_uart(uint8_t bus)
         uart_dev[bus] = NE_uart_open3(hub, HIL_NOS_NODE_NAME, cfg.nos_uri, name, bus);
         if (uart_dev[bus] == NULL)
         {
+            pthread_mutex_unlock(&open_mu);
+            pthread_mutex_unlock(&open_mu);
+            pthread_mutex_unlock(&open_mu);
+            pthread_mutex_unlock(&open_mu);
             log_msg("failed to open %s on %s", name, cfg.nos_uri);
             return NULL;
         }
         NE_uart_set_queue_size(uart_dev[bus], HIL_USART_QUEUE_SIZE);
         log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
+    pthread_mutex_unlock(&open_mu);
     return uart_dev[bus];
 }
 
@@ -403,6 +432,7 @@ static NE_I2CHandle *get_i2c(uint8_t bus)
     {
         return NULL;
     }
+    pthread_mutex_lock(&open_mu);
     if (i2c_dev[bus] == NULL)
     {
         snprintf(name, sizeof(name), "i2c_%u", bus);
@@ -415,6 +445,7 @@ static NE_I2CHandle *get_i2c(uint8_t bus)
         }
         log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
+    pthread_mutex_unlock(&open_mu);
     return i2c_dev[bus];
 }
 
@@ -429,6 +460,7 @@ static NE_SpiHandle *get_spi(uint8_t bus, uint8_t cs)
     {
         return NULL;
     }
+    pthread_mutex_lock(&open_mu);
     if (spi_dev[idx] == NULL)
     {
         snprintf(name, sizeof(name), "spi_%u", idx);
@@ -441,6 +473,7 @@ static NE_SpiHandle *get_spi(uint8_t bus, uint8_t cs)
         }
         log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
+    pthread_mutex_unlock(&open_mu);
     return spi_dev[idx];
 }
 
@@ -453,6 +486,7 @@ static NE_CanHandle *get_can(uint8_t bus)
     {
         return NULL;
     }
+    pthread_mutex_lock(&open_mu);
     if (can_dev[bus] == NULL)
     {
         snprintf(name, sizeof(name), "can_%u", bus);
@@ -465,19 +499,23 @@ static NE_CanHandle *get_can(uint8_t bus)
         }
         log_msg("opened %s in %.0f ms", name, now_ms() - t0);
     }
+    pthread_mutex_unlock(&open_mu);
     return can_dev[bus];
 }
+
+static int worker_busy(int kind, int idx);
 
 static void close_buses(void)
 {
     int i;
 
+    /* A bus whose worker is stuck in a transaction is left open: closing it could block */
     for (i = 0; i < HIL_NUM_BUSES; i++)
     {
         if (uart_dev[i]) NE_uart_close(&uart_dev[i]);
-        if (i2c_dev[i])  NE_i2c_close(&i2c_dev[i]);
-        if (spi_dev[i])  NE_spi_close(&spi_dev[i]);
-        if (can_dev[i])  NE_can_close(&can_dev[i]);
+        if (i2c_dev[i] && !worker_busy(WORKER_I2C, i)) NE_i2c_close(&i2c_dev[i]);
+        if (spi_dev[i] && !worker_busy(WORKER_SPI, i)) NE_spi_close(&spi_dev[i]);
+        if (can_dev[i] && !worker_busy(WORKER_CAN, i)) NE_can_close(&can_dev[i]);
     }
 }
 
@@ -580,9 +618,10 @@ static int parse_txn(const hil_frame_t *f, const uint8_t **tx, size_t *txlen, si
     return (*rxlen <= HIL_MAX_PAYLOAD) ? 0 : -1;
 }
 
-static void handle_txn(const hil_frame_t *f)
+/* Runs one transaction and sends the reply; called on the bus's worker thread */
+static void execute_txn(const hil_frame_t *f)
 {
-    static uint8_t rx[HIL_MAX_PAYLOAD];
+    uint8_t        rx[HIL_MAX_PAYLOAD];
     const uint8_t *tx;
     size_t         txlen;
     size_t         rxlen;
@@ -654,6 +693,137 @@ static void handle_txn(const hil_frame_t *f)
     serial_send(rsp_type, f->bus, f->seq, status, f->addr, rx, (status == HIL_STATUS_OK) ? rxlen : 0);
 }
 
+/*
+** Bus workers (NCR-006)
+*/
+typedef struct
+{
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             started;
+    int             busy; /* a transaction is queued or running */
+    hil_frame_t     job;
+} bus_worker_t;
+
+static bus_worker_t workers[WORKER_KINDS][HIL_NUM_BUSES];
+
+static void *worker_main(void *arg)
+{
+    bus_worker_t *w = arg;
+
+    for (;;)
+    {
+        pthread_mutex_lock(&w->mu);
+        while (!w->busy)
+        {
+            pthread_cond_wait(&w->cv, &w->mu);
+        }
+        pthread_mutex_unlock(&w->mu);
+
+        /* The job isn't touched by the main thread while busy is set */
+        execute_txn(&w->job);
+
+        pthread_mutex_lock(&w->mu);
+        w->busy = 0;
+        pthread_mutex_unlock(&w->mu);
+    }
+    return NULL;
+}
+
+/* Worker for a transaction frame, or NULL if the bus number is out of range */
+static bus_worker_t *worker_for(const hil_frame_t *f)
+{
+    unsigned idx;
+
+    switch (f->type)
+    {
+        case HIL_I2C_TXN:
+            return f->bus < HIL_NUM_BUSES ? &workers[WORKER_I2C][f->bus] : NULL;
+        case HIL_SPI_TXN:
+            idx = (unsigned)f->bus * 10u + f->addr; /* hwlib maps (bus, cs) to spi_<bus*10+cs> */
+            return (f->addr < 10 && idx < HIL_NUM_BUSES) ? &workers[WORKER_SPI][idx] : NULL;
+        case HIL_CAN_TXN:
+            return f->bus < HIL_NUM_BUSES ? &workers[WORKER_CAN][f->bus] : NULL;
+        default:
+            return NULL;
+    }
+}
+
+/* Main thread: hand a transaction to its bus's worker without waiting for it */
+static void dispatch_txn(const hil_frame_t *f)
+{
+    uint8_t       rsp_type = (uint8_t)(f->type + 1);
+    bus_worker_t *w        = worker_for(f);
+    pthread_t     thread;
+    int           busy;
+
+    if (w == NULL)
+    {
+        serial_send(rsp_type, f->bus, f->seq, HIL_STATUS_BAD_REQ, f->addr, NULL, 0);
+        return;
+    }
+
+    pthread_mutex_lock(&w->mu);
+    if (!w->started)
+    {
+        pthread_cond_init(&w->cv, NULL);
+        if (pthread_create(&thread, NULL, worker_main, w) != 0)
+        {
+            pthread_mutex_unlock(&w->mu);
+            log_msg("cannot start a worker thread for frame type 0x%02x bus %u", f->type, f->bus);
+            serial_send(rsp_type, f->bus, f->seq, HIL_STATUS_BUS_ERROR, f->addr, NULL, 0);
+            return;
+        }
+        pthread_detach(thread);
+        w->started = 1;
+    }
+    busy = w->busy;
+    if (!busy)
+    {
+        w->job  = *f;
+        w->busy = 1;
+        pthread_cond_signal(&w->cv);
+    }
+    pthread_mutex_unlock(&w->mu);
+
+    if (busy)
+    {
+        /* The previous transaction on this bus is still waiting for its simulator */
+        if (cfg.verbose)
+        {
+            log_msg("bus busy: frame type 0x%02x bus %u answered BUS_ERROR", f->type, f->bus);
+        }
+        serial_send(rsp_type, f->bus, f->seq, HIL_STATUS_BUS_ERROR, f->addr, NULL, 0);
+    }
+}
+
+static int worker_busy(int kind, int idx)
+{
+    bus_worker_t *w = &workers[kind][idx];
+    int           busy;
+
+    pthread_mutex_lock(&w->mu);
+    busy = w->busy;
+    pthread_mutex_unlock(&w->mu);
+    return busy;
+}
+
+static void init_workers(void)
+{
+    int k;
+    int i;
+
+    for (k = 0; k < WORKER_KINDS; k++)
+    {
+        for (i = 0; i < HIL_NUM_BUSES; i++)
+        {
+            pthread_mutex_init(&workers[k][i].mu, NULL);
+            workers[k][i].started = 0;
+            workers[k][i].busy    = 0;
+        }
+    }
+}
+
 static void handle_frame(const hil_frame_t *f)
 {
     last_mcu_frame = time(NULL);
@@ -721,7 +891,7 @@ static void handle_frame(const hil_frame_t *f)
         case HIL_I2C_TXN:
         case HIL_SPI_TXN:
         case HIL_CAN_TXN:
-            handle_txn(f);
+            dispatch_txn(f);
             break;
 
         case HIL_TO_PKT:
@@ -888,6 +1058,8 @@ int main(int argc, char *argv[])
     {
         return 1;
     }
+
+    init_workers();
 
     hub = NE_create_transport_hub(0);
     if (hub == NULL)
