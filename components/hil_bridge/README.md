@@ -113,6 +113,6 @@ The fake MCU can also be pointed at a running bridge through any pty or serial d
 ## Limitations
 
 - **The cFS COSMOS interfaces don't apply.** COSMOS's DEBUG and RADIO interfaces talk to cFS apps; the FlatSat uses its own `FLATSAT_UMB` and `FLATSAT_RF` interfaces instead (ICD §3.6).
-- **The bridge is sequential.** Like hwlib, NOS Engine transactions block the bridge and have no timeout. If the engine server dies mid-transaction, the bridge hangs; a second Ctrl-C or `docker stop` exits it.
+- **Each bus has its own worker thread.** NOS Engine transactions block until the simulator answers (its timeouts default to infinite), so a stalled simulator holds only its own bus. Further requests for that bus get `BUS_ERROR` straight away, and every other bus carries on (FlatSat NCR-006). If the engine server itself dies, every bus stalls; a second Ctrl-C or `docker stop` exits the bridge.
 - **The MCU runs on its own clock.** NOS3 runs in real time by default (`sim-microseconds-per-tick` equals `real-microseconds-per-tick`). The MCU doesn't receive NOS time ticks, so keep the sim at 1:1 speed.
 - **Large packets are dropped.** Packets over `HIL_MAX_PAYLOAD` (2048 bytes by default) are dropped with a log message. If you shrink it on the MCU to save RAM, keep it at least as large as your biggest telemetry packet.
