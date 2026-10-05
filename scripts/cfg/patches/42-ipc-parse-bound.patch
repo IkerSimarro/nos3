@@ -1,0 +1,78 @@
+diff --git a/MetaCode/JsonToTxRxIPC.jl b/MetaCode/JsonToTxRxIPC.jl
+index 362137c..e947fb5 100644
+--- a/MetaCode/JsonToTxRxIPC.jl
++++ b/MetaCode/JsonToTxRxIPC.jl
+@@ -127,12 +127,14 @@ function BeginReadFunction(S)
+       end
+       F *= "\n";      
+       
+-      F *= "      NumBytes = read(Socket,Msg,16384);\n";
+-      F *= "      if (NumBytes < 0) {\n";
++      F *= "      /* HITL FlatSat NCR-010: parse only the bytes just read */\n";
++      F *= "      NumBytes = read(Socket,Msg,16383);\n";
++      F *= "      if (NumBytes <= 0) {\n";
+       F *= "         //printf(\"Error reading from socket in ReadFromSocket.\\n\");\n";
+       F *= "         //exit(1);\n";
+       F *= "         return;\n";
+       F *= "      }\n";
++      F *= "      Msg[NumBytes] = '\\0';\n";
+       F *= "      write(Socket,Ack,4);\n\n";
+       
+       F *= "      Done = 0;\n";
+@@ -141,7 +143,7 @@ function BeginReadFunction(S)
+       F *= "         /* Parse lines from Msg, newline-delimited */\n";
+       F *= "         Iline = 0;\n";
+       F *= "         memset(line,'\\0',512);\n";
+-      F *= "         while((Msg[Imsg] != '\\n') && (Iline < 511) && (Imsg < 16383)) {\n";
++      F *= "         while((Msg[Imsg] != '\\n') && (Iline < 511) && (Imsg < NumBytes)) {\n";
+       F *= "            line[Iline++] = Msg[Imsg++];\n";
+       F *= "         }\n";
+       F *= "         line[Iline++] = Msg[Imsg++];\n";
+@@ -160,6 +162,7 @@ end
+ ################################################################################
+ function EndReadFunction(F)
+ 
++      F *= "         if (Imsg >= NumBytes) Done = 1;\n";
+       F *= "         if (!strncmp(line,\"[ENDMSG]\",8)) {\n";
+       F *= "            Done = 1;\n";
+       F *= "            //sprintf(line,\"[ENDMSG] reached\\n\");\n";
+diff --git a/Source/AutoCode/TxRxIPC.c b/Source/AutoCode/TxRxIPC.c
+index 460c0c3..4b5ba15 100644
+--- a/Source/AutoCode/TxRxIPC.c
++++ b/Source/AutoCode/TxRxIPC.c
+@@ -560,12 +560,16 @@ void ReadFromSocket(SOCKET Socket, long EchoEnabled)
+       char Ack[4] = "Ack\0";
+       long k;
+ 
+-      NumBytes = read(Socket,Msg,16384);
+-      if (NumBytes < 0) {
++      /* HITL FlatSat NCR-010: parse only the bytes just read. NOS3's simulators don't end messages with
++         [ENDMSG] (the wheel simulator not even with a newline), so the loop used to run on into stale data
++         left in Msg by earlier, longer messages: a new command picked up an old command's trailing digits */
++      NumBytes = read(Socket,Msg,16383);
++      if (NumBytes <= 0) {
+          //printf("Error reading from socket in ReadFromSocket.\n");
+          //exit(1);
+          return;
+       }
++      Msg[NumBytes] = '\0';
+       write(Socket,Ack,4);
+ 
+       Done = 0;
+@@ -574,7 +578,7 @@ void ReadFromSocket(SOCKET Socket, long EchoEnabled)
+          /* Parse lines from Msg, newline-delimited */
+          Iline = 0;
+          memset(line,'\0',512);
+-         while((Msg[Imsg] != '\n') && (Iline < 511) && (Imsg < 16383)) {
++         while((Msg[Imsg] != '\n') && (Iline < 511) && (Imsg < NumBytes)) {
+             line[Iline++] = Msg[Imsg++];
+          }
+          line[Iline++] = Msg[Imsg++];
+@@ -877,6 +881,7 @@ void ReadFromSocket(SOCKET Socket, long EchoEnabled)
+             Done = 1;
+             //sprintf(line,"[ENDMSG] reached\n");
+          }
++         if (Imsg >= NumBytes) Done = 1;
+          if (Imsg >= 16383) {
+             Done = 1;
+             printf("Imsg limit exceeded\n");

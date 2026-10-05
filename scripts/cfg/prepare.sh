@@ -27,6 +27,8 @@ echo "Prepare 42..."
 cd $USER_NOS3_DIR
 git clone https://github.com/nasa-itc/42.git --depth 1 -b dev_20260403
 cd $USER_NOS3_DIR/42
+# HITL FlatSat NCR-010: 42's socket reader parsed past the received bytes and re-applied stale actuator commands
+git apply --check $SCRIPT_DIR/patches/42-ipc-parse-bound.patch 2> /dev/null && git apply $SCRIPT_DIR/patches/42-ipc-parse-bound.patch
 $DFLAGS_CPUS -v $BASE_DIR:$BASE_DIR -v $USER_NOS3_DIR:$USER_NOS3_DIR -w $USER_NOS3_DIR/42 --name "nos3_42_build" $DBOX make
 echo ""
 echo ""
