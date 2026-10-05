@@ -54,7 +54,7 @@ type u8 | bus u8 | seq u8 | status u8 | addr u32 LE | payload | crc16 LE   (CRC-
 | `I2C_OPEN` / `SPI_OPEN` / `CAN_OPEN` 0x22/0x32/0x42 | MCU→ | as for the transactions | none. Opens the bus ahead of the first transaction: opening takes ~50 ms, which would otherwise count against that transaction's timeout. |
 | `CI_PKT` 0x50 | →MCU | – | umbilical telecommand: one space packet from COSMOS |
 | `TO_PKT` 0x51 | MCU→ | – | umbilical telemetry: one space packet for COSMOS |
-| `RF_TX` / `RF_RX` 0x54/0x55 | MCU→ / →MCU | – | software-in-the-loop only: RF frames to and from the ground station link emulator |
+| `RF_TX` / `RF_RX` 0x54/0x55 | MCU→ / →MCU | `RF_RX`: RSSI (bits 0–15, dBm) and SNR (bits 16–23, 0.25 dB) | software-in-the-loop only: RF frames to and from the ground station link emulator. Datagrams from the emulator start with 4 bytes of metadata (RSSI `i16` big-endian, SNR `i8`, flags), which the bridge moves into `addr` (ICD §7.5) |
 | `TRQ_CMD` 0x60 | MCU→ | bus = torquer 0–2 | duty `i16` LE in 0.01 % (−10000…10000), sent to the torquer sim as `"<n> <duty %>\n"` |
 | `TIME` 0x61 | →MCU | – | NOS3 simulation time, 1 Hz while the link is up: seconds `u32` LE + subseconds `u16` LE (CUC, J2000) |
 

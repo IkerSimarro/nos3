@@ -364,21 +364,39 @@ static void udp_send(hil_udp_dest_t *dest, const uint8_t *data, size_t len)
 }
 
 /* Forward one datagram from a UDP socket to the MCU as the given frame type */
+/* RF_RX datagrams from the link emulator start with 4 bytes of radio metadata (FlatSat ICD 7.5): RSSI i16
+** dBm big-endian, SNR i8 in 0.25 dB, flags. They go into the frame's addr as the ground modem would put
+** them: RSSI in bits 0-15, SNR in bits 16-23 */
+#define RF_META_LEN 4
+
 static void udp_to_mcu(int fd, uint8_t type)
 {
     static uint8_t buf[HIL_UDP_MAX];
-    ssize_t        n = recv(fd, buf, sizeof(buf), 0);
+    ssize_t        n    = recv(fd, buf, sizeof(buf), 0);
+    uint32_t       addr = 0;
+    uint8_t       *data = buf;
 
     if (n <= 0)
     {
         return;
+    }
+    if (type == HIL_RF_RX)
+    {
+        if (n < RF_META_LEN)
+        {
+            log_msg("dropping %zd-byte RF datagram: shorter than its metadata", n);
+            return;
+        }
+        addr = (uint32_t)(uint16_t)((buf[0] << 8) | buf[1]) | ((uint32_t)buf[2] << 16);
+        data += RF_META_LEN;
+        n -= RF_META_LEN;
     }
     if ((size_t)n > HIL_MAX_PAYLOAD)
     {
         log_msg("dropping %zd-byte packet for MCU (max %d); raise HIL_MAX_PAYLOAD", n, HIL_MAX_PAYLOAD);
         return;
     }
-    serial_send(type, 0, bridge_seq++, HIL_STATUS_OK, 0, buf, (size_t)n);
+    serial_send(type, 0, bridge_seq++, HIL_STATUS_OK, addr, data, (size_t)n);
 }
 
 /*

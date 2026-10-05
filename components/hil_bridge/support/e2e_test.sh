@@ -66,7 +66,7 @@ while True:
         if key.fileobj is umb and data == b"umb-tm-test":
             out.sendto(b"umb-tc-test", ("127.0.0.1", 9010))
         elif key.fileobj is rf and data == b"rf-tx-test":
-            out.sendto(b"rf-rx-test", ("127.0.0.1", 9020))
+            out.sendto(b"\xff\x88\x14\x00rf-rx-test", ("127.0.0.1", 9020))  # RSSI -120 dBm, SNR 5 dB
         elif key.fileobj is trq:
             out.sendto(b"trq:" + data, ("127.0.0.1", 9010))
 EOF2

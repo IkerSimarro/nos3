@@ -4,3 +4,9 @@
 INTERFACE FLATSAT_UMB udp_interface.rb nos-fsw 9010 9011 nil nil 128 nil nil
   PROTOCOL WRITE flatsat_checksum_protocol.rb
   TARGET FLATSAT
+
+# HITL FlatSat radio link: telecommands to the ground station software on flatsat-gs:9030, telemetry that
+# survived the (simulated) RF link from it on port 9031 (FlatSat ICD 3.6)
+INTERFACE FLATSAT_RF udp_interface.rb flatsat-gs 9030 9031 nil nil 128 nil nil
+  PROTOCOL WRITE flatsat_checksum_protocol.rb
+  TARGET FLATSAT_RF

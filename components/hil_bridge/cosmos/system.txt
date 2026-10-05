@@ -1,3 +1,4 @@
 
 # HITL FlatSat (appended by scripts/cfg/declare_cosmos_target.py)
 DECLARE_TARGET ../../COMPONENTS/FLATSAT FLATSAT
+DECLARE_TARGET ../../COMPONENTS/FLATSAT_RF FLATSAT_RF

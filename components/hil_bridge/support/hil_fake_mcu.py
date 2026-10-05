@@ -146,7 +146,8 @@ def test(link: Link, wait: float, check_egse: bool, check_uart: bool, check_time
         ok &= expect_reply(link, hil_link.Frame(hil_link.TO_PKT, payload=b"umb-tm-test"),
                            hil_link.CI_PKT, b"umb-tc-test", "umbilical: TO_PKT out, CI_PKT back")
         ok &= expect_reply(link, hil_link.Frame(hil_link.RF_TX, payload=b"rf-tx-test"),
-                           hil_link.RF_RX, b"rf-rx-test", "RF link: RF_TX out, RF_RX back")
+                           hil_link.RF_RX, b"rf-rx-test", "RF link: RF_TX out, RF_RX back with RSSI/SNR",
+                           addr=0x0014FF88)  # RSSI -120 dBm, SNR 20 x 0.25 dB (ICD 7.5)
         # The stand-in torquer sim reports the text it received as an umbilical command
         ok &= expect_reply(link, hil_link.Frame(hil_link.TRQ_CMD, bus=1, payload=struct.pack("<h", -2500)),
                            hil_link.CI_PKT, b"trq:1 -25.000000\n", "torquer: TRQ_CMD -25 % on torquer 1")
@@ -157,13 +158,14 @@ def test(link: Link, wait: float, check_egse: bool, check_uart: bool, check_time
     return ok
 
 
-def expect_reply(link: Link, frame: hil_link.Frame, reply_type: int, expected: bytes, what: str) -> bool:
+def expect_reply(link: Link, frame: hil_link.Frame, reply_type: int, expected: bytes, what: str,
+                 addr=None) -> bool:
     link.send(frame)
     got = next((f for f in link.recv(5.0) if f.type == reply_type), None)
-    if got is not None and got.payload == expected:
+    if got is not None and got.payload == expected and (addr is None or got.addr == addr):
         print(f"PASS {what}")
         return True
-    print(f"FAIL {what}: got {got.payload if got else 'nothing'}")
+    print(f"FAIL {what}: got {got.payload if got else 'nothing'}" + (f", addr 0x{got.addr:08X}" if got else ""))
     return False
 
 
