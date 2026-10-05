@@ -27,6 +27,7 @@ TELEMETRY FLATSAT OBC_HK LITTLE_ENDIAN "OBC housekeeping"
     STATE AUTO_CONVERGED 4
     STATE LOW_BATTERY 5
     STATE NODE_LOST 6
+    STATE BATTERY_RECOVERED 7
   APPEND_ITEM RESET_CAUSE 8 UINT "Reset cause"
     STATE POWER_ON 0
     STATE WATCHDOG 1
@@ -107,7 +108,7 @@ TELEMETRY FLATSAT ADCS_STATE LITTLE_ENDIAN "ADCS estimates and actuator commands
     STATE MANUAL 3
   APPEND_ITEM SUN_VALID 8 UINT "Sun valid"
   APPEND_ITEM CONVERGED 8 UINT "Converged"
-  APPEND_ITEM SPARE 8 UINT "Spare"
+  APPEND_ITEM PHYS_RW_STATUS 8 UINT "Physical wheel RW_TLM status: bit 0 driver enabled, 1 at set point, 2 saturated, 3 command timeout, 4 safe"
   APPEND_ITEM RATE_EST_0 32 FLOAT "Rate est"
     UNITS "rad/s" "rad/s"
   APPEND_ITEM RATE_EST_1 32 FLOAT "Rate est"
@@ -123,14 +124,14 @@ TELEMETRY FLATSAT ADCS_STATE LITTLE_ENDIAN "ADCS estimates and actuator commands
   APPEND_ITEM SUN_BODY_0 32 FLOAT "Unit vector"
   APPEND_ITEM SUN_BODY_1 32 FLOAT "Unit vector"
   APPEND_ITEM SUN_BODY_2 32 FLOAT "Unit vector"
-  APPEND_ITEM POINTING_ERROR 32 FLOAT "Pointing error"
+  APPEND_ITEM POINTING_ERROR 32 FLOAT "Angle between the +X axis and the Sun; -1 without a Sun vector"
     UNITS "rad" "rad"
-  APPEND_ITEM RW_CMD_SPEED_0 32 FLOAT "Rw cmd speed"
-    UNITS "rad/s" "rad/s"
-  APPEND_ITEM RW_CMD_SPEED_1 32 FLOAT "Rw cmd speed"
-    UNITS "rad/s" "rad/s"
-  APPEND_ITEM RW_CMD_SPEED_2 32 FLOAT "Rw cmd speed"
-    UNITS "rad/s" "rad/s"
+  APPEND_ITEM RW_CMD_TORQUE_0 32 FLOAT "Torque commanded to the simulated wheels"
+    UNITS "N m" "N m"
+  APPEND_ITEM RW_CMD_TORQUE_1 32 FLOAT "Torque commanded to the simulated wheels"
+    UNITS "N m" "N m"
+  APPEND_ITEM RW_CMD_TORQUE_2 32 FLOAT "Torque commanded to the simulated wheels"
+    UNITS "N m" "N m"
   APPEND_ITEM RW_SIM_SPEED_0 32 FLOAT "Rw sim speed"
     UNITS "rad/s" "rad/s"
   APPEND_ITEM RW_SIM_SPEED_1 32 FLOAT "Rw sim speed"
@@ -143,7 +144,8 @@ TELEMETRY FLATSAT ADCS_STATE LITTLE_ENDIAN "ADCS estimates and actuator commands
     UNITS "0.01 %" "0.01 %"
   APPEND_ITEM TRQ_DUTY_2 16 INT "Trq duty"
     UNITS "0.01 %" "0.01 %"
-  APPEND_ITEM SPARE2 16 INT "Spare2"
+  APPEND_ITEM AUTO_MODES 8 UINT "1 = automatic mode transitions enabled (OBC_SET_AUTO_MODES)"
+  APPEND_ITEM SPARE2 8 UINT "Spare2"
   APPEND_ITEM PHYS_RW_CMD_SPEED 32 FLOAT "Phys rw cmd speed"
     UNITS "rad/s" "rad/s"
   APPEND_ITEM PHYS_RW_MEAS_SPEED 32 FLOAT "Phys rw meas speed"
