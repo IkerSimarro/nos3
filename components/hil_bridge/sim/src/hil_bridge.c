@@ -618,19 +618,35 @@ static int parse_txn(const hil_frame_t *f, const uint8_t **tx, size_t *txlen, si
     return (*rxlen <= HIL_MAX_PAYLOAD) ? 0 : -1;
 }
 
-/* Runs one transaction and sends the reply; called on the bus's worker thread */
-static void execute_txn(const hil_frame_t *f)
+/* A transaction's reply, built on the worker thread and sent once the worker is idle again */
+typedef struct
 {
-    uint8_t        rx[HIL_MAX_PAYLOAD];
+    uint8_t  type;
+    uint8_t  bus;
+    uint8_t  seq;
+    uint8_t  status;
+    uint32_t addr;
+    size_t   len;
+    uint8_t  data[HIL_MAX_PAYLOAD];
+} txn_reply_t;
+
+/* Runs one transaction and builds its reply; called on the bus's worker thread */
+static void execute_txn(const hil_frame_t *f, txn_reply_t *r)
+{
+    uint8_t       *rx = r->data;
     const uint8_t *tx;
     size_t         txlen;
     size_t         rxlen;
-    uint8_t        rsp_type = (uint8_t)(f->type + 1);
-    uint8_t        status   = HIL_STATUS_BUS_ERROR;
+    uint8_t        status = HIL_STATUS_BUS_ERROR;
 
+    r->type = (uint8_t)(f->type + 1);
+    r->bus  = f->bus;
+    r->seq  = f->seq;
+    r->addr = f->addr;
+    r->len  = 0;
     if (parse_txn(f, &tx, &txlen, &rxlen) != 0)
     {
-        serial_send(rsp_type, f->bus, f->seq, HIL_STATUS_BAD_REQ, f->addr, NULL, 0);
+        r->status = HIL_STATUS_BAD_REQ;
         return;
     }
     memset(rx, 0, rxlen);
@@ -690,7 +706,8 @@ static void execute_txn(const hil_frame_t *f)
             break;
     }
 
-    serial_send(rsp_type, f->bus, f->seq, status, f->addr, rx, (status == HIL_STATUS_OK) ? rxlen : 0);
+    r->status = status;
+    r->len    = (status == HIL_STATUS_OK) ? rxlen : 0;
 }
 
 /*
@@ -710,6 +727,7 @@ static bus_worker_t workers[WORKER_KINDS][HIL_NUM_BUSES];
 static void *worker_main(void *arg)
 {
     bus_worker_t *w = arg;
+    txn_reply_t   reply;
 
     for (;;)
     {
@@ -721,11 +739,14 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&w->mu);
 
         /* The job isn't touched by the main thread while busy is set */
-        execute_txn(&w->job);
+        execute_txn(&w->job, &reply);
 
+        /* Idle before replying (NCR-011): the MCU sends its next request on this bus as soon as it has the reply,
+           and on a loaded machine this thread can be descheduled between the two */
         pthread_mutex_lock(&w->mu);
         w->busy = 0;
         pthread_mutex_unlock(&w->mu);
+        serial_send(reply.type, reply.bus, reply.seq, reply.status, reply.addr, reply.data, reply.len);
     }
     return NULL;
 }
