@@ -96,9 +96,9 @@ def test(link: Link, wait: float, check_egse: bool, check_uart: bool, check_time
     while rsp is None and time.monotonic() < deadline:
         rsp = link.request(hil_link.Frame(hil_link.HEARTBEAT, payload=b"ping"), hil_link.HEARTBEAT, timeout=1.0)
     if rsp and rsp.payload == b"ping":
-        print("PASS heartbeat round trip")
+        print("PASS [TC-03.1] heartbeat round trip")
     else:
-        print(f"FAIL heartbeat: no echo from bridge within {wait:.0f} s")
+        print(f"FAIL [TC-03.1] heartbeat: no echo from bridge within {wait:.0f} s")
         return False
 
     link.send(hil_link.Frame(hil_link.LOG, payload=b"fake MCU starting self-test"))
@@ -112,22 +112,22 @@ def test(link: Link, wait: float, check_egse: bool, check_uart: bool, check_time
         print("FAIL EPS HK: no I2C_RSP")
         ok = False
     elif rsp.status != 0:
-        print(f"FAIL EPS HK: bridge reported {hil_link.STATUS_NAMES.get(rsp.status, rsp.status)}")
+        print(f"FAIL [TC-03.2] EPS HK: bridge reported {hil_link.STATUS_NAMES.get(rsp.status, rsp.status)}")
         ok = False
     elif len(rsp.payload) != EPS_HK_LEN + 1 or eps_crc8(rsp.payload[:EPS_HK_LEN]) != rsp.payload[EPS_HK_LEN]:
-        print(f"FAIL EPS HK: bad reply ({len(rsp.payload)} bytes, CRC mismatch or wrong length)")
+        print(f"FAIL [TC-03.2] EPS HK: bad reply ({len(rsp.payload)} bytes, CRC mismatch or wrong length)")
         ok = False
     else:
         batt_v, batt_t, v33, v50, v12, eps_t, sa_v, sa_t = struct.unpack(">8H", rsp.payload[:16])
-        print(f"PASS EPS HK: battery raw={batt_v} temp raw={batt_t} 3v3={v33} 5v0={v50} 12v={v12} "
+        print(f"PASS [TC-03.2] EPS HK: battery raw={batt_v} temp raw={batt_t} 3v3={v33} 5v0={v50} 12v={v12} "
               f"solar array raw={sa_v}")
 
     rsp = link.request(hil_link.Frame(hil_link.I2C_TXN, bus=99, addr=EPS_I2C_ADDR,
                                       payload=hil_link.txn_payload(b"\x00", 1)), hil_link.I2C_RSP)
     if rsp and rsp.status == 2:
-        print("PASS invalid bus rejected with BAD_REQ")
+        print("PASS [TC-03.3] invalid bus rejected with BAD_REQ")
     else:
-        print(f"FAIL invalid bus: got {rsp}")
+        print(f"FAIL [TC-03.3] invalid bus: got {rsp}")
         ok = False
 
     if check_uart:
@@ -136,21 +136,21 @@ def test(link: Link, wait: float, check_egse: bool, check_uart: bool, check_time
         echo = b"".join(f.payload for f in link.recv(3.0)
                         if f.type == hil_link.UART_RX and f.bus == SAMPLE_UART_BUS)
         if SAMPLE_NOOP_CMD in echo:
-            print("PASS UART path: sample sim echoed NOOP on usart_16")
+            print("PASS [TC-03.4] UART path: sample sim echoed NOOP on usart_16")
         else:
-            print(f"FAIL UART path: received {echo.hex() or 'nothing'} on usart_16")
+            print(f"FAIL [TC-03.4] UART path: received {echo.hex() or 'nothing'} on usart_16")
             ok = False
 
     if check_egse:
         # These need the stand-in EGSE endpoints from e2e_test.sh, which answer each message
         ok &= expect_reply(link, hil_link.Frame(hil_link.TO_PKT, payload=b"umb-tm-test"),
-                           hil_link.CI_PKT, b"umb-tc-test", "umbilical: TO_PKT out, CI_PKT back")
+                           hil_link.CI_PKT, b"umb-tc-test", "[TC-03.5] umbilical: TO_PKT out, CI_PKT back")
         ok &= expect_reply(link, hil_link.Frame(hil_link.RF_TX, payload=b"rf-tx-test"),
-                           hil_link.RF_RX, b"rf-rx-test", "RF link: RF_TX out, RF_RX back with RSSI/SNR",
+                           hil_link.RF_RX, b"rf-rx-test", "[TC-03.6] RF link: RF_TX out, RF_RX back with RSSI/SNR",
                            addr=0x0014FF88)  # RSSI -120 dBm, SNR 20 x 0.25 dB (ICD 7.5)
         # The stand-in torquer sim reports the text it received as an umbilical command
         ok &= expect_reply(link, hil_link.Frame(hil_link.TRQ_CMD, bus=1, payload=struct.pack("<h", -2500)),
-                           hil_link.CI_PKT, b"trq:1 -25.000000\n", "torquer: TRQ_CMD -25 % on torquer 1")
+                           hil_link.CI_PKT, b"trq:1 -25.000000\n", "[TC-03.7] torquer: TRQ_CMD -25 % on torquer 1")
 
     if check_time:
         ok &= check_time_frames(link)
@@ -180,13 +180,13 @@ def check_time_frames(link: Link) -> bool:
                 sec, sub = struct.unpack("<IH", f.payload)
                 times.append(sec + sub / 65536.0)
     if len(times) < 3:
-        print(f"FAIL simulation time: {len(times)} TIME frames in 4.5 s")
+        print(f"FAIL [TC-03.8] simulation time: {len(times)} TIME frames in 4.5 s")
         return False
     steps = [b - a for a, b in zip(times, times[1:])]
     if times[0] < START_TIME or not all(0.5 < s < 1.5 for s in steps):
-        print(f"FAIL simulation time: {times[0]:.2f} s, steps {[round(s, 3) for s in steps]}")
+        print(f"FAIL [TC-03.8] simulation time: {times[0]:.2f} s, steps {[round(s, 3) for s in steps]}")
         return False
-    print(f"PASS simulation time: J2000 {times[0]:.2f} s, advancing {[round(s, 2) for s in steps]} s per frame")
+    print(f"PASS [TC-03.8] simulation time: J2000 {times[0]:.2f} s, advancing {[round(s, 2) for s in steps]} s per frame")
     return True
 
 
