@@ -198,7 +198,7 @@ static speed_t baud_to_speed(int baud)
     }
 }
 
-static int serial_open(const char *dev, int baud)
+static int serial_open(const char *dev, int baud, int quiet)
 {
     struct termios tio;
     speed_t        speed = baud_to_speed(baud);
@@ -213,7 +213,10 @@ static int serial_open(const char *dev, int baud)
     fd = open(dev, O_RDWR | O_NOCTTY);
     if (fd < 0)
     {
-        log_msg("cannot open %s: %s", dev, strerror(errno));
+        if (!quiet)
+        {
+            log_msg("cannot open %s: %s", dev, strerror(errno));
+        }
         return -1;
     }
 
@@ -253,6 +256,11 @@ static void serial_send(uint8_t type, uint8_t bus, uint8_t seq, uint8_t status, 
     }
 
     pthread_mutex_lock(&serial_mu);
+    if (serial_fd < 0)
+    {
+        pthread_mutex_unlock(&serial_mu); /* device gone (see serial_lost): drop, as a cut line would */
+        return;
+    }
     tx_frame.type   = type;
     tx_frame.bus    = bus;
     tx_frame.seq    = seq;
@@ -952,7 +960,40 @@ static void handle_frame(const hil_frame_t *f)
     }
 }
 
-static void read_serial(hil_decoder_t *dec)
+/*
+** The serial device went away: a USB MCU restarting (its port disappears until it re-enumerates), or the
+** Linux OBC process exiting (its pty closes). Close it at once, so a USB device comes back under the same
+** name, and reopen it when it reappears (main loop).
+*/
+static void serial_lost(const char *why)
+{
+    pthread_mutex_lock(&serial_mu);
+    if (serial_fd >= 0)
+    {
+        close(serial_fd);
+        serial_fd = -1;
+    }
+    pthread_mutex_unlock(&serial_mu);
+    mcu_link_up = 0;
+    log_msg("serial device lost (%s); waiting for it to come back", why);
+}
+
+static int serial_reopen(void)
+{
+    int fd = serial_open(cfg.serial_dev, cfg.baud, 1);
+
+    if (fd < 0)
+    {
+        return -1;
+    }
+    pthread_mutex_lock(&serial_mu);
+    serial_fd = fd;
+    pthread_mutex_unlock(&serial_mu);
+    log_msg("serial device %s back", cfg.serial_dev);
+    return 0;
+}
+
+static void read_serial(hil_decoder_t *dec, int hangup)
 {
     static uint8_t buf[4096];
     ssize_t        n = read(serial_fd, buf, sizeof(buf));
@@ -960,8 +1001,12 @@ static void read_serial(hil_decoder_t *dec)
 
     if (n < 0 && errno != EINTR && errno != EAGAIN)
     {
-        log_msg("serial read failed: %s", strerror(errno));
-        keep_running = 0;
+        serial_lost(strerror(errno));
+        return;
+    }
+    if (n == 0 && hangup)
+    {
+        serial_lost("hang-up");
         return;
     }
 
@@ -1035,6 +1080,7 @@ int main(int argc, char *argv[])
     int           opt;
     int           i;
     time_t        last_time_sent = 0;
+    struct timespec last_reopen  = {0, 0};
     hil_decoder_t dec;
     struct pollfd fds[3];
     struct sigaction sa;
@@ -1089,7 +1135,7 @@ int main(int argc, char *argv[])
     log_msg("RF link:   in :%d, out %s:%d", cfg.rf_rx_port, cfg.rf_host, cfg.rf_tx_port);
     log_msg("torquers:  %s:%d; time: bus '%s' on %s", cfg.trq_host, cfg.trq_port, cfg.time_bus, cfg.time_uri);
 
-    serial_fd = serial_open(cfg.serial_dev, cfg.baud);
+    serial_fd = serial_open(cfg.serial_dev, cfg.baud, 0);
     umb_sock  = udp_bind(cfg.umb_tc_port);
     rf_sock   = udp_bind(cfg.rf_rx_port);
     tx_sock   = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1137,7 +1183,24 @@ int main(int argc, char *argv[])
     log_msg("running, waiting for MCU");
     while (keep_running)
     {
-        int rc = poll(fds, 3, HIL_POLL_MS);
+        int rc;
+
+        /* Reopen a lost serial device every half second; poll() skips the entry while it is gone */
+        if (serial_fd < 0)
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if ((now.tv_sec - last_reopen.tv_sec) * 1000 + (now.tv_nsec - last_reopen.tv_nsec) / 1000000 >= 500)
+            {
+                last_reopen = now;
+                if (serial_reopen() == 0)
+                {
+                    hil_decoder_init(&dec);
+                }
+            }
+        }
+        fds[0].fd = serial_fd;
+        rc        = poll(fds, 3, HIL_POLL_MS);
         if (rc < 0 && errno != EINTR)
         {
             log_msg("poll failed: %s", strerror(errno));
@@ -1148,12 +1211,11 @@ int main(int argc, char *argv[])
         {
             if (fds[0].revents & (POLLERR | POLLNVAL))
             {
-                log_msg("serial device error, exiting");
-                break;
+                serial_lost("device error");
             }
-            if (fds[0].revents & (POLLIN | POLLHUP))
+            else if (fds[0].revents & (POLLIN | POLLHUP))
             {
-                read_serial(&dec);
+                read_serial(&dec, fds[0].revents & POLLHUP);
             }
             if (fds[1].revents & POLLIN)
             {
@@ -1188,7 +1250,10 @@ int main(int argc, char *argv[])
         NE_destroy_bus(&time_bus);
     }
     NE_destroy_transport_hub(&hub);
-    close(serial_fd);
+    if (serial_fd >= 0)
+    {
+        close(serial_fd);
+    }
     close(umb_sock);
     close(rf_sock);
     close(tx_sock);
