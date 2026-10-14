@@ -60,6 +60,10 @@ typedef enum
     HIL_RF_TX     = 0x54, /* MCU->  : SIL only, RF frame for the ground station link emulator */
     HIL_RF_RX     = 0x55, /* ->MCU  : SIL only, RF frame from the ground station link emulator; also
                              used by the ground modem, with RSSI/SNR packed into addr */
+    /* The FlatSat CAN bus (ICD 6) for a node whose CAN board isn't fitted: the bridge carries it */
+    HIL_CANBUS_TX     = 0x56, /* MCU->  : frame to transmit; addr = 11-bit identifier, payload = data (0-8) */
+    HIL_CANBUS_RX     = 0x57, /* ->MCU  : frame received from the bus, same layout */
+    HIL_CANBUS_STATUS = 0x58, /* ->MCU  : once a second while the bridge carries the bus; payload = state u8, 1 */
 
     HIL_TRQ_CMD   = 0x60, /* MCU->  : magnetorquer bus = index, payload = duty i16 LE in 0.01 % */
     HIL_TIME      = 0x61  /* ->MCU  : NOS3 simulation time, payload = seconds u32 LE, subseconds u16 LE */

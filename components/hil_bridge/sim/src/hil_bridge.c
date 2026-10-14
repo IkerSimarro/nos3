@@ -35,6 +35,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <termios.h>
+#include <net/if.h>
+#include <linux/can.h>
+#include <linux/can/raw.h>
 #include <time.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -82,6 +85,8 @@ typedef struct
     const char *time_bus;
     double      start_time;  /* common.absolute-start-time, J2000 seconds */
     long        us_per_tick; /* common.sim-microseconds-per-tick */
+    /* The FlatSat CAN bus for an MCU without its CAN board (ICD 8.1 CANBUS_*): a SocketCAN interface, or NULL */
+    const char *canbus_iface;
     int         verbose;
 } hil_config_t;
 
@@ -126,6 +131,7 @@ static int serial_fd = -1;
 static int umb_sock  = -1;
 static int rf_sock   = -1;
 static int tx_sock   = -1;
+static int canbus_sock = -1;
 static uint8_t bridge_seq = 0;
 
 static hil_udp_dest_t umb_dest;
@@ -871,6 +877,74 @@ static void init_workers(void)
     }
 }
 
+/*
+** The FlatSat CAN bus (ICD 6) for an MCU without its CAN board (--flatsat-can IFACE): frames on the interface
+** go to the MCU as CANBUS_RX, the MCU's CANBUS_TX frames go onto the interface, and CANBUS_STATUS tells the MCU
+** once a second that the bus is there. The interface may appear after the bridge starts (sil/start_nodes.sh
+** creates it), so opening it is retried.
+*/
+static int canbus_open(void)
+{
+    struct sockaddr_can addr;
+    unsigned int        ifindex = if_nametoindex(cfg.canbus_iface);
+    int                 fd;
+
+    if (ifindex == 0)
+    {
+        return -1;
+    }
+    fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.can_family  = AF_CAN;
+    addr.can_ifindex = (int)ifindex;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    log_msg("FlatSat CAN bus: %s carried over the umbilical", cfg.canbus_iface);
+    return fd;
+}
+
+/* Also clears a pending socket error (the interface going down): read() returns it */
+static void canbus_to_mcu(void)
+{
+    struct can_frame cf;
+
+    while (read(canbus_sock, &cf, sizeof(cf)) == (ssize_t)sizeof(cf))
+    {
+        if (cf.can_id & (CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG))
+        {
+            continue; /* only classic 11-bit data frames are part of the FlatSat protocol */
+        }
+        serial_send(HIL_CANBUS_RX, 0, 0, HIL_STATUS_OK, cf.can_id & CAN_SFF_MASK, cf.data,
+                    cf.can_dlc > 8 ? 8 : cf.can_dlc);
+    }
+}
+
+static void canbus_from_mcu(const hil_frame_t *f)
+{
+    struct can_frame cf;
+
+    if (canbus_sock < 0 || f->len > 8)
+    {
+        return;
+    }
+    memset(&cf, 0, sizeof(cf));
+    cf.can_id  = f->addr & CAN_SFF_MASK;
+    cf.can_dlc = (uint8_t)f->len;
+    memcpy(cf.data, f->payload, f->len);
+    if (write(canbus_sock, &cf, sizeof(cf)) != (ssize_t)sizeof(cf) && cfg.verbose)
+    {
+        log_msg("FlatSat CAN bus: write failed: %s", strerror(errno)); /* e.g. the interface is down */
+    }
+}
+
 static void handle_frame(const hil_frame_t *f)
 {
     last_mcu_frame = time(NULL);
@@ -951,6 +1025,10 @@ static void handle_frame(const hil_frame_t *f)
 
         case HIL_TRQ_CMD:
             handle_trq(f);
+            break;
+
+        case HIL_CANBUS_TX:
+            canbus_from_mcu(f);
             break;
 
         default:
@@ -1046,6 +1124,7 @@ static void usage(const char *prog)
            "      --time-bus NAME      time bus name (default %s)\n"
            "      --start-time S       absolute-start-time, J2000 seconds (default %.1f)\n"
            "      --us-per-tick N      sim-microseconds-per-tick (default %ld)\n"
+           "      --flatsat-can IFACE  carry the FlatSat CAN bus on IFACE to an MCU without its CAN board\n"
            "  -v, --verbose            log every frame\n",
            prog, cfg.serial_dev, cfg.baud, cfg.nos_uri, cfg.umb_host, cfg.umb_tc_port, cfg.umb_tm_port,
            cfg.rf_host, cfg.rf_rx_port, cfg.rf_tx_port, cfg.trq_host, cfg.trq_port, cfg.time_uri, cfg.time_bus,
@@ -1071,6 +1150,7 @@ int main(int argc, char *argv[])
         {"time-bus", required_argument, NULL, 10},
         {"start-time", required_argument, NULL, 11},
         {"us-per-tick", required_argument, NULL, 12},
+        {"flatsat-can", required_argument, NULL, 13},
         {"verbose", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}};
@@ -1082,7 +1162,8 @@ int main(int argc, char *argv[])
     time_t        last_time_sent = 0;
     struct timespec last_reopen  = {0, 0};
     hil_decoder_t dec;
-    struct pollfd fds[3];
+    time_t        canbus_last_try = 0;
+    struct pollfd fds[4];
     struct sigaction sa;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1112,6 +1193,7 @@ int main(int argc, char *argv[])
             case 10: cfg.time_bus = optarg; break;
             case 11: cfg.start_time = atof(optarg); break;
             case 12: cfg.us_per_tick = atol(optarg); break;
+            case 13: cfg.canbus_iface = optarg; break;
             case 'v': cfg.verbose = 1; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
@@ -1179,6 +1261,8 @@ int main(int argc, char *argv[])
     fds[1].events = POLLIN;
     fds[2].fd     = rf_sock;
     fds[2].events = POLLIN;
+    fds[3].fd     = -1;
+    fds[3].events = POLLIN;
 
     log_msg("running, waiting for MCU");
     while (keep_running)
@@ -1199,8 +1283,14 @@ int main(int argc, char *argv[])
                 }
             }
         }
+        if (cfg.canbus_iface != NULL && canbus_sock < 0 && time(NULL) != canbus_last_try)
+        {
+            canbus_last_try = time(NULL);
+            canbus_sock     = canbus_open();
+        }
         fds[0].fd = serial_fd;
-        rc        = poll(fds, 3, HIL_POLL_MS);
+        fds[3].fd = canbus_sock;
+        rc        = poll(fds, 4, HIL_POLL_MS);
         if (rc < 0 && errno != EINTR)
         {
             log_msg("poll failed: %s", strerror(errno));
@@ -1225,6 +1315,10 @@ int main(int argc, char *argv[])
             {
                 udp_to_mcu(rf_sock, HIL_RF_RX);
             }
+            if (fds[3].revents & (POLLIN | POLLERR))
+            {
+                canbus_to_mcu();
+            }
         }
 
         poll_uarts();
@@ -1234,6 +1328,11 @@ int main(int argc, char *argv[])
         {
             last_time_sent = time(NULL);
             send_time();
+            if (canbus_sock >= 0)
+            {
+                static const uint8_t up = 1;
+                serial_send(HIL_CANBUS_STATUS, 0, 0, HIL_STATUS_OK, 0, &up, 1);
+            }
         }
 
         if (mcu_link_up && time(NULL) - last_mcu_frame > HIL_LINK_TIMEOUT_S)
@@ -1257,5 +1356,9 @@ int main(int argc, char *argv[])
     close(umb_sock);
     close(rf_sock);
     close(tx_sock);
+    if (canbus_sock >= 0)
+    {
+        close(canbus_sock);
+    }
     return 0;
 }
