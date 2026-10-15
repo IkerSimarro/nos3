@@ -602,6 +602,11 @@ static void handle_trq(const hil_frame_t *f)
     }
     n = snprintf(msg, sizeof(msg), "%u %f\n", f->bus, duty / 100.0);
     udp_send(&trq_dest, (const uint8_t *)msg, (size_t)n);
+    if (cfg.verbose)
+    {
+        /* The torquer sim's own log is buffered, so it can't show the latest command (TC-17) */
+        log_msg("TRQ_CMD torquer %u duty %d (0.01 %%)", f->bus, duty);
+    }
 }
 
 /*
