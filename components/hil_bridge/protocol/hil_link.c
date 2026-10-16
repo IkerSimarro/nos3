@@ -32,6 +32,7 @@ uint16_t hil_crc16(const uint8_t *data, size_t len)
 }
 
 /* COBS-encode in[0..len) into out; returns encoded length (without delimiter) or 0 if out is too small */
+/* in and out may overlap if in starts at least 1 + len/254 bytes after out (hil_encode) */
 static size_t hil_cobs_encode(const uint8_t *in, size_t len, uint8_t *out, size_t out_cap)
 {
     size_t  read_idx  = 0;
@@ -79,7 +80,7 @@ static size_t hil_cobs_encode(const uint8_t *in, size_t len, uint8_t *out, size_
     return write_idx;
 }
 
-/* COBS-decode in[0..len) into out; returns decoded length or 0 on malformed input */
+/* COBS-decode in[0..len) into out; returns decoded length or 0 on malformed input. out may be in itself */
 static size_t hil_cobs_decode(const uint8_t *in, size_t len, uint8_t *out, size_t out_cap)
 {
     size_t  read_idx  = 0;
@@ -118,9 +119,14 @@ static size_t hil_cobs_decode(const uint8_t *in, size_t len, uint8_t *out, size_
     return write_idx;
 }
 
+/*
+** Encoded in place, without a second frame-sized buffer (on the Pico, two such buffers on the stack took it past
+** its 2 KB reservation): the raw frame is assembled at the end of out, and COBS-encoded towards its start. The
+** encoder writes at most 1 + len/254 bytes ahead of what it has read, so a gap of that size keeps it behind.
+*/
 size_t hil_encode(const hil_frame_t *frame, uint8_t *out, size_t out_cap)
 {
-    uint8_t  raw[HIL_RAW_MAX];
+    uint8_t *raw;
     size_t   raw_len;
     size_t   enc_len;
     uint16_t crc;
@@ -129,6 +135,12 @@ size_t hil_encode(const hil_frame_t *frame, uint8_t *out, size_t out_cap)
     {
         return 0;
     }
+    raw_len = HIL_HEADER_LEN + (size_t)frame->len + HIL_CRC_LEN;
+    if (out_cap < raw_len + raw_len / 254 + 2) /* the longest encoding, and the delimiter */
+    {
+        return 0;
+    }
+    raw = out + (out_cap - 1 - raw_len);
 
     raw[0] = frame->type;
     raw[1] = frame->bus;
@@ -139,17 +151,9 @@ size_t hil_encode(const hil_frame_t *frame, uint8_t *out, size_t out_cap)
     raw[6] = (uint8_t)((frame->addr >> 16) & 0xFF);
     raw[7] = (uint8_t)((frame->addr >> 24) & 0xFF);
     memcpy(&raw[HIL_HEADER_LEN], frame->payload, frame->len);
-    raw_len = HIL_HEADER_LEN + frame->len;
+    crc = hil_crc16(raw, raw_len - HIL_CRC_LEN);
+    hil_put_u16(&raw[raw_len - HIL_CRC_LEN], crc);
 
-    crc = hil_crc16(raw, raw_len);
-    hil_put_u16(&raw[raw_len], crc);
-    raw_len += HIL_CRC_LEN;
-
-    /* Reserve one byte for the delimiter */
-    if (out_cap < 2)
-    {
-        return 0;
-    }
     enc_len = hil_cobs_encode(raw, raw_len, out, out_cap - 1);
     if (enc_len == 0)
     {
@@ -167,7 +171,7 @@ void hil_decoder_init(hil_decoder_t *dec)
 
 hil_decode_result_t hil_decoder_feed(hil_decoder_t *dec, uint8_t byte, hil_frame_t *frame)
 {
-    uint8_t  raw[HIL_RAW_MAX];
+    uint8_t *raw = dec->buf; /* decoded in place: COBS decoding never writes ahead of where it reads */
     size_t   raw_len;
     uint16_t crc;
     size_t   enc_len;
@@ -200,7 +204,7 @@ hil_decode_result_t hil_decoder_feed(hil_decoder_t *dec, uint8_t byte, hil_frame
         return HIL_DECODE_ERROR;
     }
 
-    raw_len = hil_cobs_decode(dec->buf, enc_len, raw, sizeof(raw));
+    raw_len = hil_cobs_decode(dec->buf, enc_len, raw, sizeof(dec->buf));
     if (raw_len < HIL_HEADER_LEN + HIL_CRC_LEN)
     {
         return HIL_DECODE_ERROR;
